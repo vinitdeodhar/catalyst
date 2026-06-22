@@ -13,6 +13,8 @@ file(GLOB SRC
     disable_assertion.cpp
     DisableAssertionPatterns.cpp
     EmptyPass.cpp
+    GateCounterInstrumentationPass.cpp
+    WhileLoopPeelingPass.cpp
     GEPInboundsPass.cpp
     GEPInboundsPatterns.cpp
     InlineNestedModules.cpp

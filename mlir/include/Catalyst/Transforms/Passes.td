@@ -333,6 +333,75 @@ def RegisterDecompRuleResourcePass : Pass<"register-decomp-rule-resource"> {
     }];
 }
 
+def GateCounterInstrumentationPass : Pass<"gate-counter-instrumentation", "mlir::ModuleOp"> {
+    let summary = "Insert per-gate runtime counters into quantum circuits.";
+    let description = [{
+        Transforms a module containing quantum.custom and quantum.measure ops to
+        add memref.global i64 counters — one per unique (gate_name, num_wires)
+        pair. After each such op an increment sequence (load / addi / store) is
+        inserted, so the counters accumulate the actual number of gate
+        applications during a run of the compiled circuit.
+
+        Intended use: add to the end of QuantumCompilationStage via
+        insert_pass_after so counters survive the full lowering chain and become
+        addressable LLVM globals ([1 x i64]) in the compiled shared library.
+
+        After execution the Python layer reads counter values via ctypes:
+            count = (ctypes.c_int64 * 1).in_dll(lib, "__gate_ctr_T_1")[0]
+
+        A JSON manifest mapping gate_label -> symbol_name is written to
+        `manifest-file` so the Python side knows which symbols to look up.
+    }];
+
+    let options = [
+        Option<
+            "manifestFile",
+            "manifest-file",
+            "std::string",
+            "\"\"",
+            "Path to write the gate-label->counter-symbol JSON manifest"
+        >
+    ];
+}
+
+def WhileLoopPeelingPass : Pass<"while-loop-peeling", "func::FuncOp"> {
+    let summary = "Peel k iterations of while loops annotated with estimated_iterations.";
+    let description = [{
+        For each scf.while op carrying an `estimated_iterations = k` IntegerAttr,
+        this pass emits k straight-line copies of the loop body — each guarded by
+        an inlined copy of the condition — before a residual while loop.
+
+        The residual while retains the original before/after regions but the
+        `estimated_iterations` attribute is removed, leaving the residual
+        unconditionally dynamic.
+
+        Peeling benefits:
+          - Exposes k flat iterations to MLIR's optimizer (gate cancellation,
+            CSE, constant folding across iteration boundaries).
+          - Lets `resource-analysis` see the first k iterations as static code.
+
+        Usage:
+            quantum-opt input.mlir --while-loop-peeling
+
+        Only scf.while ops with `estimated_iterations` are affected; all other
+        ops are left unchanged.
+    }];
+
+    let dependentDialects = [
+        "mlir::scf::SCFDialect",
+    ];
+
+    let options = [
+        Option<
+            "peelFactor",
+            "peel-factor",
+            "int64_t",
+            "-1",
+            "Override iterations to peel for all loops. -1 = use each loop's estimated_iterations."
+        >
+    ];
+}
+
 def EmptyPass : Pass<"empty"> {
     let summary = "Empty pass that does nothing.";
 

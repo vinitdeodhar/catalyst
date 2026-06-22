@@ -349,14 +349,23 @@ void ResourceAnalysis::analyzeWhileLoop(scf::WhileOp whileOp, ResourceResult &re
     analyzeRegion(whileOp.getAfter(), bodyResult, isAdjoint);
 
     if (auto estAttr = whileOp->getAttrOfType<IntegerAttr>("estimated_iterations")) {
+        // Treat as static with the provided estimate: lift the body and
+        // record a static call count, mirroring for-loop behaviour.
         int64_t iters = estAttr.getValue().getSExtValue();
-        bodyResult.multiplyByScalar(iters);
+        std::string name = makeUniqueSyntheticName("dyn_while_loop_", dynWhileLoopCounter);
+        funcResults[name] = std::move(bodyResult);
+        result.functionCalls[name] = iters;
     }
     else {
+        // Unknown trip count: lift body into dyn_while_loop_<N> and record
+        // it in varFunctionCalls so callers can supply expected iteration
+        // counts, matching the treatment of dynamic for-loops.
+        std::string name = makeUniqueSyntheticName("dyn_while_loop_", dynWhileLoopCounter);
+        funcResults[name] = std::move(bodyResult);
+        result.varFunctionCalls[name] =
+            static_cast<uint64_t>(llvm::hash_value(whileOp.getOperation()));
         result.hasDynLoop = true;
     }
-
-    result.mergeWith(bodyResult);
 }
 
 void ResourceAnalysis::analyzeIfOp(scf::IfOp ifOp, ResourceResult &result, bool isAdjoint)

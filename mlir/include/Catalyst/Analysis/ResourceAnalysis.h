@@ -56,10 +56,11 @@ class ResourceAnalysis {
     // name of the entry function
     std::string entryFuncName;
 
-    // Counters for lifted-loop names (`for_loop_<N>` vs `dyn_for_loop_<N>`),
-    // so each prefix gets its own numbering sequence.
+    // Counters for lifted-loop names (`for_loop_<N>`, `dyn_for_loop_<N>`,
+    // `dyn_while_loop_<N>`), so each prefix gets its own numbering sequence.
     int64_t forLoopCounter = 0;
     int64_t dynForLoopCounter = 0;
+    int64_t dynWhileLoopCounter = 0;
 
     // `prefix` + counter; advance counter until the name is free in `funcResults`
     std::string makeUniqueSyntheticName(llvm::StringRef prefix, int64_t &counter);
