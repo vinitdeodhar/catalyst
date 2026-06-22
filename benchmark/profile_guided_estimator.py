@@ -118,6 +118,23 @@ class ProfileReport:
     def recommended_iters(self) -> int:
         return max(1, round(self.mean_trip))
 
+    def max_iterations(self, c: float = 3.0) -> int:
+        """Return ceil(E[k] + c * sigma) — the depth bound for confidence c.
+
+        This value should be written as ``max_iterations = N`` on the target
+        ``scf.while`` op so that ``--depth-bounding`` guarantees termination
+        within N iterations with probability ≥ 1 − ε(c) under the fitted
+        geometric distribution.
+
+        Parameters
+        ----------
+        c :
+            Number of standard deviations above the mean.  Default 3.0 gives
+            P(k ≤ MAX_ITER) ≈ 99.7% for a Normal approximation; the geometric
+            tail is heavier, so this is a lower bound on coverage.
+        """
+        return math.ceil(self.mean_trip + c * self.std_trip)
+
     def summary(self, true_p: Optional[float] = None) -> str:
         lines = [
             "── Profile-Guided Estimation Report ────────────────────────────",
@@ -301,6 +318,56 @@ def per_iter_from_report(report, loop_name: str) -> Dict[str, int]:
         if "MidCircuit" in meas_name and count > 0:
             costs["Measure_1"] = costs.get("Measure_1", 0) + count
     return costs
+
+
+def annotate_mlir_max_iterations(mlir_text: str, max_iter: int) -> str:
+    """Add ``max_iterations = N : i64`` to the first ``scf.while`` in *mlir_text*.
+
+    Injects ``attributes {max_iterations = N : i64}`` at the end of the first
+    ``scf.while`` op (after the closing ``}`` of its ``do`` region), so the
+    patched text is accepted by::
+
+        quantum-opt --depth-bounding <patched.mlir>
+
+    Parameters
+    ----------
+    mlir_text :
+        The MLIR module text, e.g. from ``qjit_fn.mlir``.
+    max_iter :
+        The integer bound (typically ``ProfileReport.max_iterations(c)``).
+
+    Returns
+    -------
+    str
+        Modified MLIR text with the attribute appended after the do-region.
+    """
+    # Find the first "scf.while".
+    while_pos = mlir_text.find("scf.while")
+    if while_pos == -1:
+        raise ValueError("No 'scf.while' found in the provided MLIR text.")
+
+    # Locate the "} do {" junction between before and after regions.
+    do_marker = "} do {"
+    do_pos = mlir_text.find(do_marker, while_pos)
+    if do_pos == -1:
+        raise ValueError("No '} do {' found after 'scf.while' — already lowered?")
+
+    # Count braces from after "} do {" to find the end of the do region.
+    search_start = do_pos + len(do_marker)
+    depth = 1
+    i = search_start
+    while i < len(mlir_text) and depth > 0:
+        ch = mlir_text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        i += 1
+    # i-1 is the position of the closing '}' of the do region.
+    close_pos = i - 1
+
+    attr_str = f" attributes {{max_iterations = {max_iter} : i64}}"
+    return mlir_text[: close_pos + 1] + attr_str + mlir_text[close_pos + 1 :]
 
 
 def _analysis_name_to_counter_label(analysis_name: str) -> Optional[str]:

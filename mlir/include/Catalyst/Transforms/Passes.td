@@ -402,6 +402,32 @@ def WhileLoopPeelingPass : Pass<"while-loop-peeling", "func::FuncOp"> {
     ];
 }
 
+def DepthBoundingPass : Pass<"depth-bounding", "func::FuncOp"> {
+    let summary = "Bound while-loop depth using a max_iterations counter.";
+    let description = [{
+        For each scf.while op carrying a `max_iterations = N` IntegerAttr,
+        this pass adds an i64 counter to the loop-carried values and ANDs the
+        original loop condition with `counter < N`. This guarantees the loop
+        terminates within N iterations regardless of its original condition.
+
+        The counter is initialised to 0 and incremented each time the after
+        region executes. The `max_iterations` attribute is consumed and removed.
+
+        N is typically ceil(E[k] + c·σ), where E[k] and σ come from the
+        profile-guided resource estimator, so the loop is cut off at a
+        confidence-bounded depth while leaving the circuit correct with
+        probability ≥ 1 − ε(c).
+
+        Usage:
+            quantum-opt input.mlir --depth-bounding
+    }];
+
+    let dependentDialects = [
+        "mlir::arith::ArithDialect",
+        "mlir::scf::SCFDialect",
+    ];
+}
+
 def EmptyPass : Pass<"empty"> {
     let summary = "Empty pass that does nothing.";
 
