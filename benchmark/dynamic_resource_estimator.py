@@ -222,16 +222,20 @@ class DynamicResourceEstimator:
 
     @staticmethod
     def _extract_circuit_module(mlir_text: str) -> str:
-        """Extract the nested ``module @module__circuit { … }`` block.
+        """Extract the nested ``module @module_<name> { … }`` block.
 
-        If no such block is found the original text is returned unchanged so
-        the pass can still run (it will just see fewer functions).
+        Catalyst wraps each @qjit function's quantum circuit in a nested module
+        named @module_<fn_name> (e.g. @module_rus, @module_coin_flip).
+        The resource-analysis pass only scans top-level func.func ops, so we
+        extract that inner module.  If no such block is found the original text
+        is returned unchanged.
         """
-        marker = "module @module__circuit {"
-        start = mlir_text.find(marker)
-        if start == -1:
+        import re
+        match = re.search(r'\bmodule @module_\w+ \{', mlir_text)
+        if not match:
             return mlir_text
 
+        start = match.start()
         depth = 0
         i = start
         while i < len(mlir_text):
@@ -240,8 +244,7 @@ class DynamicResourceEstimator:
             elif mlir_text[i] == "}":
                 depth -= 1
                 if depth == 0:
-                    end = i + 1
-                    return mlir_text[start:end].strip()
+                    return mlir_text[start:i + 1].strip()
             i += 1
 
         return mlir_text
