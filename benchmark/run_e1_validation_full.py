@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """E1 Full — Validation: static per-iteration cost == runtime per-iteration cost.
 
-7 circuits: adjoint, coin_flip, rus, msd, bbht, qpe, nested_rus_bbht.
+8 circuits: adjoint, coin_flip, rus, msd, bbht, qpe, nested_rus_bbht, qft.
 
 Usage:
     python3 run_e1_validation_full.py [--n-fast N] [--n-slow N] [--json]
@@ -504,6 +504,62 @@ def run_nested(n_runs, n_data=2):
     print("          confirmed < static; exact ratio omitted (cross-level subtraction).")
 
 
+# ── 8. qft (static) ──────────────────────────────────────────────────────────
+
+def run_qft(n_runs=20, n_qubits=4):
+    """QFT-style circuit: static for_loops with dynamic inner lower bound.
+
+    N init Hadamards + N*(N-1)/2 ControlledPhaseShift gates.
+    The inner for_loop bound is wG+1 (a traced int), making this the key
+    'dynamic lower bound' case validated by the static analysis.
+    All gates are exact (no while_loop, no reset): ratio=1.000, std=0.000.
+    """
+    N = n_qubits
+
+    def _circuit():
+        @for_loop(0, N, 1)
+        def init_h(i):
+            qp.Hadamard(wires=i)
+
+        init_h()
+
+        @for_loop(0, N, 1)
+        def outer(wG):
+            @for_loop(wG + 1, N, 1)
+            def inner(wC):
+                phi = jnp.float64(jnp.pi) * (jnp.float64(2) ** (wC - wG))
+                qp.ControlledPhaseShift(phi, wires=[wC, wG])
+
+            inner()
+
+        outer()
+        return qp.state()
+
+    dev = qp.device("lightning.qubit", wires=N)
+    H_static   = float(N)
+    CPS_static = float(N * (N - 1) // 2)
+
+    print(f"\n[qft  N={N}] compiling...", end="", flush=True)
+    rows_H, rows_cps = [], []
+    with GateCounterSession(_circuit, dev) as sess:
+        print(" done. running...", end="", flush=True)
+        for i in range(n_runs):
+            r = sess.run()
+            rows_H.append(r.gate_counts.get("Hadamard_1", 0))
+            rows_cps.append(r.gate_counts.get("ControlledPhaseShift_2", 0))
+            if (i + 1) % 10 == 0:
+                print(f" {i+1}", end="", flush=True)
+    print(" done.")
+
+    _section(f"qft (static for_loops, N={N}, dyn inner bound wG+1)", n_runs, 1.0, 0.0)
+    _hdr()
+    _row("Hadamard_1              /shot", H_static,   rows_H)
+    _row("ControlledPhaseShift_2  /shot", CPS_static, rows_cps)
+    print(f"  Static formula: H={N}, CPS=N*(N-1)/2={N*(N-1)//2}")
+    print(f"  Inner for_loop bound wG+1 is traced — static analysis infers")
+    print(f"  sum(N-wG-1, wG=0..{N-1}) = {N*(N-1)//2} total CPS exactly.")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -527,6 +583,7 @@ def main():
     run_bbht(args.n_slow)
     run_qpe(args.n_fast)
     run_nested(args.n_slow)
+    run_qft(args.n_fast)
 
     print(f"\n{'='*70}")
     print("  DONE — see rows above for per-circuit results")

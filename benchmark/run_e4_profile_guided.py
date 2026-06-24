@@ -102,6 +102,25 @@ def _make_rus_circuit():
     return _circuit
 
 
+def _make_coin_flip_circuit():
+    """Return a zero-arg circuit function for the coin-flip while-loop.
+
+    Flips until heads: each iteration does H + Measure + conditional reset.
+    Trip count ~ Geom(0.5), true E[k] = 2.0.
+    """
+    def _circuit():
+        @while_loop(lambda count, result: result == 0)
+        def flip_loop(count, result):
+            qp.Hadamard(wires=0)
+            m = measure(0, reset=True)
+            return count + jnp.int64(1), jnp.int64(m)
+
+        count, _ = flip_loop(jnp.int64(0), jnp.int64(0))
+        return count
+
+    return _circuit
+
+
 def _make_msd_circuit(n_magic: int = 7, p_err: float = 0.10):
     """Return a key-arg circuit function for the MSD while-loop."""
     syndrome_wire = 0
@@ -478,6 +497,24 @@ def main():
 
     # ── Figure-4 CSV ──────────────────────────────────────────────────────────
     print_figure4_data("", report_rus, report_msd, true_E_rus, true_E_msd)
+
+    # ── Coin-flip (fast convergence baseline) ─────────────────────────────────
+    true_p_cf = 0.5
+    cf_dev = qp.device("lightning.qubit", wires=1)
+    cf_circuit = _make_coin_flip_circuit()
+
+    with GateCounterSession(cf_circuit, cf_dev) as cf_sess:
+        cf_trip_counts = run_convergence(
+            "coin-flip (Geom(0.5), true E[k]=2.0, rec_k=2)",
+            {"Hadamard_1": 1},
+            cf_sess,
+            true_p_cf,
+            args.batch_size,
+            args.n_batches,
+            args.n_bootstrap,
+            args.seed + 2,
+            None,
+        )
 
     # ── Summary ───────────────────────────────────────────────────────────────
     _hdr("Summary", "E4 Profile-Guided Refinement Convergence")

@@ -325,6 +325,91 @@ def _nested_rus_bbht_circuit():
     return fn, dev, n_wires
 
 
+def _grover_circuit(n_data: int = 4):
+    """Static Grover search circuit — for_loop only, no while_loop countdown.
+
+    Uses the standard H+oracle+diffuser structure.  n_steps is computed from
+    the theoretical optimum: floor(pi/4 * sqrt(2^n) - 0.5).
+    """
+    import math
+    n_steps = max(1, int(math.floor(math.pi / 4.0 * math.sqrt(float(2 ** n_data)) - 0.5)))
+
+    def _oracle():
+        qp.Hadamard(wires=n_data - 1)
+        if n_data == 3:
+            qp.Toffoli(wires=[0, 1, 2])
+        else:
+            qp.MultiControlledX(wires=list(range(n_data)))
+        qp.Hadamard(wires=n_data - 1)
+
+    def _diffuser():
+        for i in range(n_data):
+            qp.Hadamard(wires=i)
+            qp.PauliX(wires=i)
+        _oracle()
+        for i in range(n_data):
+            qp.PauliX(wires=i)
+            qp.Hadamard(wires=i)
+
+    def _circuit():
+        for i in range(n_data):
+            qp.Hadamard(wires=i)
+
+        @for_loop(0, n_steps, 1)
+        def grover_body(_):
+            _oracle()
+            _diffuser()
+
+        grover_body()
+        return qp.probs(wires=list(range(n_data)))
+
+    dev = qp.device("lightning.qubit", wires=n_data)
+
+    @qjit
+    def fn():
+        return qp.QNode(_circuit, dev)()
+
+    return fn, dev, n_data
+
+
+def _qft_circuit(n_qubits: int = 4):
+    """QFT-style circuit with dynamic inner for_loop lower bound (wG+1).
+
+    Structure: init H × N qubits, then N×(N-1)/2 ControlledPhaseShift gates
+    in nested for_loops where the inner bound depends on the outer variable.
+    This is the challenging case for static analysis: inner loop count varies
+    per outer iteration.
+    """
+    N = n_qubits
+
+    def _circuit():
+        @for_loop(0, N, 1)
+        def init_h(i):
+            qp.Hadamard(wires=i)
+
+        init_h()
+
+        @for_loop(0, N, 1)
+        def outer(wG):
+            @for_loop(wG + 1, N, 1)
+            def inner(wC):
+                phi = jnp.float64(jnp.pi) * (jnp.float64(2) ** (wC - wG))
+                qp.ControlledPhaseShift(phi, wires=[wC, wG])
+
+            inner()
+
+        outer()
+        return qp.state()
+
+    dev = qp.device("lightning.qubit", wires=N)
+
+    @qjit
+    def fn():
+        return qp.QNode(_circuit, dev)()
+
+    return fn, dev, N
+
+
 # ── Main timing loop ───────────────────────────────────────────────────────────
 
 def main():
@@ -415,6 +500,38 @@ def main():
         c_ms = (time.perf_counter() - t0) * 1000
         a_ms = _time_analysis(est, fn) * 1000
         _row(name, nq, "while + while (nested)", c_ms, a_ms)
+        rows.append((name, c_ms, a_ms))
+    except Exception as e:
+        print(f"SKIP ({e})")
+        rows.append((name, float("nan"), float("nan")))
+
+    # ── 10. Grover (n_data=4, static for_loop) ─────────────────────────────
+    import math as _math
+    _n_grover_steps = max(1, int(_math.floor(_math.pi / 4.0 * _math.sqrt(16.0) - 0.5)))
+    name = f"grover (n_data=4, {_n_grover_steps} steps)"
+    print(f"  [{name}] compiling...", end=" ", flush=True)
+    try:
+        t0 = time.perf_counter()
+        fn, dev, nq = _grover_circuit(n_data=4)
+        fn()  # trigger compilation
+        c_ms = (time.perf_counter() - t0) * 1000
+        a_ms = _time_analysis(est, fn) * 1000
+        _row(name, nq, f"for ({_n_grover_steps} steps)", c_ms, a_ms)
+        rows.append((name, c_ms, a_ms))
+    except Exception as e:
+        print(f"SKIP ({e})")
+        rows.append((name, float("nan"), float("nan")))
+
+    # ── 11. QFT (n_qubits=4, dynamic inner for_loop bound) ─────────────────
+    name = "qft (n_qubits=4, dyn bound)"
+    print(f"  [{name}] compiling...", end=" ", flush=True)
+    try:
+        t0 = time.perf_counter()
+        fn, dev, nq = _qft_circuit(n_qubits=4)
+        fn()  # trigger compilation
+        c_ms = (time.perf_counter() - t0) * 1000
+        a_ms = _time_analysis(est, fn) * 1000
+        _row(name, nq, "for+for (dyn lower bound)", c_ms, a_ms)
         rows.append((name, c_ms, a_ms))
     except Exception as e:
         print(f"SKIP ({e})")

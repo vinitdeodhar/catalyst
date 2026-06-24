@@ -104,6 +104,66 @@ def run_pennylane_specs():
     except Exception as e:
         print(f"  ERROR: {type(e).__name__}: {e}")
 
+    # --- 1b2. Static Grover (n_data=3, 1 Grover step) ---
+    subsection("1b2. Grover (n_data=3, 1 step) — static for_loop circuit")
+
+    @qp.qnode(qp.device("default.qubit", wires=3))
+    def grover_static_pl():
+        for i in range(3):
+            qp.Hadamard(wires=i)
+        # 1 Grover step: oracle (mark |111>) + diffuser
+        qp.Hadamard(wires=2)
+        qp.Toffoli(wires=[0, 1, 2])
+        qp.Hadamard(wires=2)
+        for i in range(3):
+            qp.Hadamard(wires=i)
+            qp.PauliX(wires=i)
+        qp.Hadamard(wires=2)
+        qp.Toffoli(wires=[0, 1, 2])
+        qp.Hadamard(wires=2)
+        for i in range(3):
+            qp.PauliX(wires=i)
+            qp.Hadamard(wires=i)
+        return qp.probs(wires=[0, 1, 2])
+
+    try:
+        result = qp.specs(grover_static_pl)()
+        d = result.to_dict()
+        gc = d["resources"]["gate_types"]
+        total = d["resources"]["num_gates"]
+        print(f"  total_gates : {total}  (expected: H×13 + X×6 + Toffoli×2 = 21)")
+        print(f"  gate_counts : {dict(gc)}")
+        print(f"  verdict     : {'✓ correct (static)' if total == 21 else f'unexpected total {total}'}")
+    except Exception as e:
+        print(f"  ERROR: {type(e).__name__}: {e}")
+
+    # --- 1b3. Static QFT (n_qubits=4) ---
+    subsection("1b3. QFT (n_qubits=4) — nested for_loop with dynamic inner bound")
+
+    @qp.qnode(qp.device("default.qubit", wires=4))
+    def qft_static_pl():
+        for i in range(4):
+            qp.Hadamard(wires=i)
+        for wG in range(4):
+            for wC in range(wG + 1, 4):
+                import math as _math
+                phi = _math.pi * float(2 ** (wC - wG))
+                qp.ControlledPhaseShift(phi, wires=[wC, wG])
+        return qp.state()
+
+    try:
+        result = qp.specs(qft_static_pl)()
+        d = result.to_dict()
+        gc = d["resources"]["gate_types"]
+        total = d["resources"]["num_gates"]
+        print(f"  total_gates : {total}  (expected: H×4 + CPS×6 = 10)")
+        print(f"  gate_counts : {dict(gc)}")
+        print(f"  note        : PL unrolls Python for-loop statically (wG bound is Python int)")
+        print(f"  Catalyst     uses for_loop with traced wG+1 bound — static analysis required")
+        print(f"  verdict     : {'✓ PL handles static (Python) for-loops' if total == 10 else f'unexpected total {total}'}")
+    except Exception as e:
+        print(f"  ERROR: {type(e).__name__}: {e}")
+
     # --- 1c. Dynamic while_loop (measurement-driven — coin-flip) ---
     subsection("1c. coin-flip — dynamic while_loop(measure-driven)")
 
@@ -194,6 +254,48 @@ def run_qiskit():
     print(f"  depth       : {qc_static.depth()}")
     print(f"  verdict     : ✓ correct (1 iteration, static)")
     results["static_rus"] = ops
+
+    # --- 2a2. Static Grover (n_data=3) ---
+    subsection("2a2. Grover (n_data=3, 1 step) — static circuit (Qiskit)")
+
+    qr_g = QuantumRegister(3, 'q')
+    qc_grover = QuantumCircuit(qr_g)
+    for i in range(3):
+        qc_grover.h(i)
+    qc_grover.h(2); qc_grover.ccx(0, 1, 2); qc_grover.h(2)
+    for i in range(3):
+        qc_grover.h(i); qc_grover.x(i)
+    qc_grover.h(2); qc_grover.ccx(0, 1, 2); qc_grover.h(2)
+    for i in range(3):
+        qc_grover.x(i); qc_grover.h(i)
+
+    ops_grover = dict(qc_grover.count_ops())
+    total_grover = sum(ops_grover.values())
+    print(f"  count_ops   : {ops_grover}")
+    print(f"  total_gates : {total_grover}  (expected: h×13 + x×6 + ccx×2 = 21)")
+    print(f"  verdict     : {'✓ correct (static)' if total_grover == 21 else f'unexpected {total_grover}'}")
+    results["static_grover"] = ops_grover
+
+    # --- 2a3. Static QFT (n_qubits=4) ---
+    subsection("2a3. QFT (n_qubits=4) — static nested loops (Qiskit)")
+
+    import math as _math
+    qr_q = QuantumRegister(4, 'q')
+    qc_qft = QuantumCircuit(qr_q)
+    for i in range(4):
+        qc_qft.h(i)
+    for wG in range(4):
+        for wC in range(wG + 1, 4):
+            phi = _math.pi * float(2 ** (wC - wG))
+            qc_qft.cp(phi, wC, wG)
+
+    ops_qft = dict(qc_qft.count_ops())
+    total_qft = sum(ops_qft.values())
+    print(f"  count_ops   : {ops_qft}")
+    print(f"  total_gates : {total_qft}  (expected: h×4 + cp×6 = 10)")
+    print(f"  note        : Qiskit 'cp' = ControlledPhaseShift (2-qubit)")
+    print(f"  verdict     : {'✓ correct (static)' if total_qft == 10 else f'unexpected {total_qft}'}")
+    results["static_qft"] = ops_qft
 
     # --- 2b. coin-flip — dynamic while_loop ---
     subsection("2b. coin-flip — dynamic while_loop (Qiskit)")
