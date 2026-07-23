@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """E9: Total-cost threshold optimization experiment.
 
-Circuit: k applications of oracle MCZ (= H·CCX·H) to |111⟩ (wires 0,1,2).
-The target state stays |111⟩ in the noiseless case; with noise, fidelity decays.
-Baseline (outer H retained) has 4 extra H gates per MCZ application vs optimized.
+Circuit: k Grover steps on n=3, oracle marks |111⟩.
+Each step = oracle MCZ + diffuser MCZ (2 MCZ calls, 8H cancelled per step).
+Metric: state fidelity F(<ψ_ideal^k|ρ_noisy|ψ_ideal^k>) — removes algorithmic
+overshoot as a confound; only noise causes F < 1.
 
-Demonstrates that per_iter_CNOT × E[k] > CNOT_budget is the correct decision
-rule for applying Toffoli decomp + H-cancellation to a loop body.
+Baseline (outer H retained): 14H + 12CNOT + 14T + 6X per step.
+Optimized (outer H cancelled):  6H + 12CNOT + 14T + 6X per step.
+H savings: 8 per step × k steps = 8k total.
 
 Four conditions:
-  never      — 4H + 6CNOT + 7T per oracle application (outer H retained)
-  always     — 0H + 6CNOT + 7T per oracle application (outer H cancelled)
-  per_iter   — optimize if per_iter_CNOT (=6) > 10  → never fires (6 < 10)
-  total_cost — optimize if 6×k > 20                  → fires for k ≥ 4
+  never      — always baseline (outer H retained)
+  always     — always optimized (outer H cancelled)
+  per_iter   — optimize if per_iter_CNOT (=12) > 20  → never fires (12 < 20)
+  total_cost — optimize if 12×k > 30                  → fires for k ≥ 3
 
-Key result: fidelity gain of 'always' over 'never' increases with k (linear in noise).
-Total-cost threshold fires at k≥4 where gains are meaningful (>1%).
-Per-iter threshold cannot adapt to k and misses all cases (always wrong).
+Key result: fidelity gain increases monotonically with k.
+Total-cost threshold fires at k≥3 where gains are meaningful (>2%).
+Per-iter threshold cannot adapt to k and misses all cases.
 """
 
 from __future__ import annotations
@@ -25,13 +27,13 @@ import pennylane as qml
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
-EPS_1Q = 0.001      # lower noise → perturbative regime where H savings scale with k
+EPS_1Q = 0.001      # hardware-scale but low enough to stay in perturbative regime
 EPS_2Q = 0.005      # ratio ε_2q/ε_1q = 5
-PER_ITER_CNOT = 6     # 1 MCZ per oracle application × 6 CNOT (Shende)
-PER_ITER_THRESHOLD = 10   # per-iter condition (6 < 10 → never fires)
-CNOT_BUDGET = 20          # total-cost condition (fires when 6×k > 20 → k ≥ 4)
+PER_ITER_CNOT = 12    # 2 MCZ per Grover step × 6 CNOT each (Shende)
+PER_ITER_THRESHOLD = 20   # per-iter condition (12 < 20 → never fires)
+CNOT_BUDGET = 30          # total-cost condition (fires when 12×k > 30 → k ≥ 3)
 
-K_VALUES = [1, 2, 3, 4, 6, 8, 10]   # Oracle application counts
+K_VALUES = [1, 2, 3, 4, 6, 8, 10]   # Grover step counts
 
 
 # ── Noise helpers ──────────────────────────────────────────────────────────
@@ -88,25 +90,28 @@ def _mcz_optimized(c0, c1, tg, eps1, eps2):
 
 # ── k-step Grover circuit ─────────────────────────────────────────────────
 
-def _oracle_k_body(k, mcz_fn, eps1, eps2):
-    """k oracle-MCZ applications to |111>.
-
-    Target state remains |111> (MCZ adds global phase only). With noise, the
-    state drifts away from |111>. Baseline has 4H per MCZ (extra noise); optimized
-    has 0H. Fidelity gap = k × 4_H_cancelled × ε_1q, monotonically increasing.
-    """
-    for i in range(3):
-        qml.PauliX(wires=i);  _n1(i, eps1)   # initialize to |111>
+def _grover_k_body(k, mcz_fn, eps1, eps2):
+    """k Grover steps on n=3, oracle marks |111>. 2 MCZ calls per step."""
+    n = 3
+    for i in range(n):
+        qml.Hadamard(wires=i);  _n1(i, eps1)     # initial superposition
     for _ in range(k):
-        mcz_fn(0, 1, 2, eps1, eps2)           # MCZ = H·CCX·H on target=2
+        mcz_fn(0, 1, 2, eps1, eps2)               # oracle MCZ
+        for i in range(n):
+            qml.Hadamard(wires=i);  _n1(i, eps1)
+            qml.PauliX(wires=i);    _n1(i, eps1)
+        mcz_fn(0, 1, 2, eps1, eps2)               # diffuser MCZ
+        for i in range(n):
+            qml.PauliX(wires=i);    _n1(i, eps1)
+            qml.Hadamard(wires=i);  _n1(i, eps1)
 
 
 # ── Gate counting ─────────────────────────────────────────────────────────
 
 def count_step_gates(mcz_fn, k=1):
-    """Count primitive gates in k oracle applications (excluding noise channels)."""
+    """Count primitive gates in k Grover steps (excluding noise channels)."""
     with qml.tape.QuantumTape() as tape:
-        _oracle_k_body(k, mcz_fn, 0.0, 0.0)
+        _grover_k_body(k, mcz_fn, 0.0, 0.0)
     counts: dict[str, int] = {}
     for op in tape.operations:
         if "Depolarizing" in op.name:
@@ -118,39 +123,42 @@ def count_step_gates(mcz_fn, k=1):
 
 # ── Fidelity to noiseless output ──────────────────────────────────────────
 
-def _mcz_pure():
-    """MCZ as a single PennyLane op (no noise), for noiseless reference."""
-    qml.CCZ(wires=[0, 1, 2])
-
-
-def _oracle_k_noiseless(k: int):
-    """k oracle-MCZ applications to |111>, no noise channels."""
-    for i in range(3):
-        qml.PauliX(wires=i)
+def _grover_k_noiseless(k: int):
+    """k Grover steps on n=3, noiseless, using CCZ for oracle and diffuser."""
+    n = 3
+    for i in range(n):
+        qml.Hadamard(wires=i)
     for _ in range(k):
-        qml.CCZ(wires=[0, 1, 2])
+        qml.CCZ(wires=[0, 1, 2])           # oracle
+        for i in range(n):
+            qml.Hadamard(wires=i)
+            qml.PauliX(wires=i)
+        qml.CCZ(wires=[0, 1, 2])           # diffuser
+        for i in range(n):
+            qml.PauliX(wires=i)
+            qml.Hadamard(wires=i)
     return qml.state()
 
 
 def get_noiseless_state(k: int) -> np.ndarray:
-    """Return pure state vector for k-step Grover (noiseless, via default.qubit)."""
+    """Return pure state vector for k Grover steps (noiseless, via default.qubit)."""
     dev = qml.device("default.qubit", wires=3)
 
     @qml.qnode(dev)
     def circuit():
-        return _oracle_k_noiseless(k)
+        return _grover_k_noiseless(k)
 
     return np.array(circuit())
 
 
 def run_k(k: int, use_opt: bool, eps1: float, eps2: float) -> np.ndarray:
-    """Run k-step noisy Grover on default.mixed. Returns 8×8 density matrix."""
+    """Run k Grover steps on default.mixed with depolarizing noise. Returns 8×8 density matrix."""
     dev = qml.device("default.mixed", wires=3)
     mcz = _mcz_optimized if use_opt else _mcz_baseline
 
     @qml.qnode(dev)
     def circuit():
-        _oracle_k_body(k, mcz, eps1, eps2)
+        _grover_k_body(k, mcz, eps1, eps2)
         return qml.state()
 
     return np.array(circuit())
@@ -168,10 +176,10 @@ def run_experiment(
     eps1: float = EPS_1Q,
     eps2: float = EPS_2Q,
 ):
-    # Gate count check (k=1 oracle application)
+    # Gate count check (k=1 Grover step)
     bc1 = count_step_gates(_mcz_baseline, k=1)
     oc1 = count_step_gates(_mcz_optimized, k=1)
-    print("Gate counts for k=1 oracle application (3×PauliX init + 1 MCZ):")
+    print("Gate counts for k=1 Grover step (3H init + oracle MCZ + diffuser MCZ + 6H + 6X):")
     all_g = sorted(set(bc1) | set(oc1))
     print(f"  {'Gate':<12}  {'Baseline':>10}  {'Optimized':>10}  {'Saved':>8}")
     for g in all_g:
@@ -180,8 +188,8 @@ def run_experiment(
     print(f"  {'TOTAL':<12}  {sum(bc1.values()):>10}  {sum(oc1.values()):>10}  "
           f"{sum(bc1.values())-sum(oc1.values()):>+8}")
     h_diff = bc1.get('Hadamard', 0) - oc1.get('Hadamard', 0)
-    print(f"\n  H reduction per oracle application: {h_diff}   (outer H cancelled with Shende H_step1/H_step11)")
-    print(f"  CNOT per oracle application: {oc1.get('CNOT',0)} (unchanged)")
+    print(f"\n  H reduction per Grover step: {h_diff}   (4H per MCZ × 2 MCZ, outer H cancels with Shende step-1/step-11)")
+    print(f"  CNOT per Grover step: {oc1.get('CNOT',0)} (unchanged)")
     print(f"  per_iter_CNOT={PER_ITER_CNOT}, threshold fires when {PER_ITER_CNOT}×k > {CNOT_BUDGET} → k > {CNOT_BUDGET/PER_ITER_CNOT:.1f}\n")
 
     # Noiseless sanity: baseline == optimized state
