@@ -491,22 +491,23 @@ def WidthGuardedMcxDecompPass : Pass<"width-guarded-mcx-decomp", "mlir::ModuleOp
         A multi-controlled `quantum.custom "PauliX"` with N control qubits has two
         standard decompositions with a qubit-vs-gate trade-off:
 
-          - ancilla-free  : peak width N+1, O(N^2) two-qubit gates (native op left
+          - ancilla-free  : O(N^2) two-qubit gates, no extra qubits (native op left
                             in place; lowered ancilla-free downstream).
-          - V-chain       : peak width 2N-1 (N-2 clean ancillas), 2N-3 Toffolis,
-                            i.e. O(N) — strictly cheaper on gates and depth, but
-                            only usable when the ancillas fit the device.
+          - V-chain       : 2N-3 Toffolis on N-2 clean ancillas, i.e. O(N) —
+                            strictly cheaper on gates and depth, but needs the
+                            ancillas to fit the device.
 
-        This pass reads the symbolic peak width (exact at compile time, per the
-        value-semantics liveness of the resource analysis) and emits the V-chain
-        Toffoli ladder — allocating N-2 clean ancilla qubits via `quantum.alloc_qb`,
-        computing the AND-ladder, flipping the target, and uncomputing the ladder so
-        the ancillas return to |0> before `quantum.dealloc_qb` — exactly when the
-        V-chain fits the device budget:
+        The guard input is the program's peak qubit width as reported by
+        ResourceAnalysis (its value-semantics liveness), not a hardcoded formula.
+        Emitting the V-chain adds the ladder's N-2 clean ancillas, so the pass
+        emits it exactly when
 
-            2*N - 1  <=  qubit-budget
+            width(from ResourceAnalysis) + (N-2)  <=  qubit-budget
 
-        Otherwise the multi-controlled op is left untouched (ancilla-free path).
+        allocating the ancillas via `quantum.alloc_qb`, computing the AND-ladder,
+        flipping the target, and uncomputing the ladder so the ancillas return to
+        |0> before `quantum.dealloc_qb`.  Otherwise the multi-controlled op is left
+        untouched (ancilla-free path).
         The two decompositions are extensionally equal (the V-chain uncomputes its
         ancillas), so no herald / semantic contract is needed.
 

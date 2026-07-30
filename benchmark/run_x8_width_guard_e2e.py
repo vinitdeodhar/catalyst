@@ -7,10 +7,10 @@ Every number here comes from the real Catalyst compilation pipeline:
     ``quantum.custom "PauliX" ctrls(...)`` op in the IR).
   * The ``width-guarded-mcx-decomp`` MLIR pass (C++, in
     mlir/lib/Catalyst/Transforms/WidthGuardedMcxDecompPass.cpp) is inserted into
-    the compilation pipeline before the gate-counter pass.  When the V-chain
-    width 2N-1 fits ``qubit-budget`` it rewrites the MCX into a clean-ancilla
-    Toffoli ladder (allocating N-2 ancillas via quantum.alloc_qb); otherwise it
-    leaves the native op in place.
+    the compilation pipeline before the gate-counter pass.  It reads the current
+    program width from ResourceAnalysis and, when that width plus the V-chain's
+    N-2 ancillas fits ``qubit-budget``, rewrites the MCX into a clean-ancilla
+    Toffoli ladder (quantum.alloc_qb); otherwise it leaves the native op.
   * The ``gate-counter-instrumentation`` MLIR pass counts the *resulting*
     primitives on each real execution (carrying true stochastic trip counts for
     the dynamic loops).
@@ -18,8 +18,12 @@ Every number here comes from the real Catalyst compilation pipeline:
     a native multi-controlled X is costed at its ancilla-free O(N^2) cost, the
     V-chain at its 2N-3 Toffolis.
 
+Circuits declare only their NATIVE register width; the pass's quantum.alloc_qb
+adds the V-chain ancillas at runtime (lightning grows the register), so the
+ResourceAnalysis width the guard reads is the true native width.
+
 before = pass with qubit-budget=0  (never fires -> native ancilla-free MCX)
-after  = pass with qubit-budget=Q  (fires -> V-chain where 2N-1 <= Q)
+after  = pass with qubit-budget=Q  (fires -> V-chain where width+N-2 <= Q)
 
 The pass is the ONLY difference between before and after: same circuit, same
 pipeline, only the budget parameter changes.
@@ -50,8 +54,8 @@ _LAMBDA = 6.0 / 5.0
 
 # ── benchmark circuit builders (all use NATIVE MultiControlledX) ─────────────
 # Each returns (body_fn, n_ctrl, total_wires, n_profile, is_dynamic).
-# total_wires is sized for the V-chain (2N-1 around the MCX) so both budgets run
-# on the same device.
+# total_wires is the NATIVE register width; the pass adds V-chain ancillas via
+# quantum.alloc_qb at runtime.
 
 def build_synthetic(N=6):
     def body():
@@ -59,7 +63,7 @@ def build_synthetic(N=6):
             qp.Hadamard(wires=i)
         qp.MultiControlledX(wires=list(range(N)) + [N])
         return qp.probs(wires=[N])
-    return body, N, 2 * N - 1, 1, False
+    return body, N, N + 1, 1, False           # declare NATIVE width; pass alloc_qb's ancillas
 
 
 def _mcz_native(n_data):
@@ -85,7 +89,7 @@ def build_grover(n_data=6, k=2):
             for i in range(n_data):
                 qp.PauliX(wires=i); qp.Hadamard(wires=i)
         return qp.probs(wires=list(range(n_data)))
-    return body, N, 2 * n_data - 3, 1, False
+    return body, N, n_data, 1, False          # native width
 
 
 def build_bbht(n_data=6):
@@ -125,14 +129,14 @@ def build_bbht(n_data=6):
 
         found, _, _ = bbht_loop(jnp.bool_(False), jnp.float64(1.0), key)
         return found
-    return body, N, 2 * n_data - 3, 25, True
+    return body, N, n_data, 25, True          # native width
 
 
 def build_nested(n_data=5):
     """Nested: outer BBHT-style search (native MCX) with an inner RUS gadget."""
     N = n_data - 1
     n_space = jnp.int64(2 ** n_data)
-    anc = 2 * n_data - 3          # RUS ancilla placed above the V-chain region
+    anc = n_data                  # RUS ancilla right after the data register
 
     def body():
         key = jax.random.PRNGKey(0)
@@ -179,7 +183,7 @@ def build_nested(n_data=5):
 
         found, _, _ = outer(jnp.bool_(False), jnp.float64(1.0), key)
         return found
-    return body, N, anc + 1, 20, True
+    return body, N, n_data + 1, 20, True      # native width (data + RUS ancilla)
 
 
 BENCHMARKS = {

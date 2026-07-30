@@ -15,11 +15,18 @@
 // WidthGuardedMcxDecompPass
 // ─────────────────────────
 // Selects the decomposition of a multi-controlled X gate
-// (`quantum.custom "PauliX"` with N control qubits) based on the symbolic
-// peak-qubit-width, evaluated against a device `qubit-budget`:
+// (`quantum.custom "PauliX"` with N control qubits) using the peak-qubit-width
+// reported by ResourceAnalysis, evaluated against a device `qubit-budget`.
 //
-//   ancilla-free : width N+1, O(N^2) 2q gates   -> op left untouched.
-//   V-chain      : width 2N-1, 2N-3 Toffolis    -> emitted iff 2N-1 <= budget.
+// The current program width is taken from the estimator (ResourceAnalysis's
+// value-semantics liveness -> ResourceResult::numQubits()); it is NOT a
+// hardcoded formula.  Emitting the V-chain adds the ladder's clean ancillas, so
+// the post-transform width is
+//
+//     currentWidth (from estimator) + nAncillas (ladder requirement)
+//
+// and the V-chain is emitted iff that fits `qubit-budget`; otherwise the
+// ancilla-free native op is left in place.
 //
 // The V-chain allocates N-2 clean ancillas (`quantum.alloc_qb`), computes an
 // AND-ladder into them, flips the target with the final ancilla, then uncomputes
@@ -47,6 +54,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 
+#include "Catalyst/Analysis/ResourceAnalysis.h"
+#include "Catalyst/Analysis/ResourceResult.h"
 #include "Quantum/IR/QuantumOps.h"
 
 using namespace mlir;
@@ -157,18 +166,37 @@ struct WidthGuardedMcxDecompPass
     void runOnOperation() final
     {
         auto module = cast<ModuleOp>(getOperation());
+        auto &analysis = getAnalysis<ResourceAnalysis>();
 
-        // Collect matching MCX ops first so walk and rewrite don't interfere.
+        // Current peak qubit width of the program, from the estimator's
+        // value-semantics liveness (ResourceResult::numQubits()).  Taken as the
+        // max over all analysed functions so the register-allocating entry (or
+        // the widest loop body) dominates.  No width formula is assumed here.
+        int64_t currentWidth = 0;
+        for (const auto &entry : analysis.getResults()) {
+            currentWidth = std::max(currentWidth, entry.second.numQubits());
+        }
+        if (currentWidth == 0) {
+            // Estimator reported nothing; make no (unfounded) decision.
+            markAllAnalysesPreserved();
+            return;
+        }
+
+        // Collect MCX ops whose V-chain form fits the budget.  The only added
+        // width is the ladder's clean-ancilla requirement (nAnc = N-2), which is
+        // exactly the number of quantum.alloc_qb the emitter will issue.
         SmallVector<std::pair<CustomOp, int64_t>> targets;
         module.walk([&](CustomOp op) {
             int64_t N = 0;
             if (isMultiControlledX(op, N)) {
-                int64_t vchainWidth = 2 * N - 1;
+                int64_t nAnc = N - 2;
+                int64_t postWidth = currentWidth + nAnc;
                 LLVM_DEBUG(llvm::dbgs()
                            << "[" << DEBUG_TYPE << "] MCX N=" << N
-                           << " vchain-width=" << vchainWidth
+                           << " currentWidth=" << currentWidth
+                           << " +ancillas=" << nAnc << " -> postWidth=" << postWidth
                            << " budget=" << qubitBudget << "\n");
-                if (vchainWidth <= qubitBudget) {
+                if (postWidth <= qubitBudget) {
                     targets.push_back({op, N});
                 }
             }
