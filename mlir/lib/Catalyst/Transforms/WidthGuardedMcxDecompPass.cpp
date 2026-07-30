@@ -88,20 +88,16 @@ static bool isMultiControlledX(CustomOp op, int64_t &nControls)
     return true;
 }
 
-// First multi-controlled X in a region (the loop body's MCX), or null.
-static CustomOp findMcx(Region &region, int64_t &nControls)
+// All multi-controlled X ops in a region (the loop body's MCXs).
+static SmallVector<CustomOp> findAllMcx(Region &region)
 {
-    CustomOp found;
+    SmallVector<CustomOp> mcxs;
     region.walk([&](CustomOp op) {
         int64_t n = 0;
-        if (!found && isMultiControlledX(op, n)) {
-            found = op;
-            nControls = n;
-            return WalkResult::interrupt();
-        }
-        return WalkResult::advance();
+        if (isMultiControlledX(op, n))
+            mcxs.push_back(op);
     });
-    return found;
+    return mcxs;
 }
 
 // Rewrite `mcx` into its V-chain Toffoli ladder in place (self-contained builder).
@@ -167,18 +163,21 @@ struct WidthGuardedMcxDecompPass
         auto &analysis = getAnalysis<ResourceAnalysis>();
 
         // Collect dynamic-bound for-loops whose body holds a multi-controlled X.
+        // `delta` is the total per-iteration gate saving over all MCX in the body.
         SmallVector<std::pair<scf::ForOp, int64_t>> targets;
         module.walk([&](scf::ForOp forOp) {
             bool isDynamic = false;
             const ResourceResult *body = analysis.getForLoopBody(forOp, isDynamic);
             if (!body || !isDynamic) // only symbolic-bound loops get a runtime guard
                 return;
-            int64_t c = 0;
-            if (!findMcx(forOp.getBodyRegion(), c))
+            int64_t delta = 0;
+            for (CustomOp mcx : findAllMcx(forOp.getBodyRegion())) {
+                int64_t c = mcx.getInCtrlQubits().size();
+                delta += gateSavingPerIter(c);
+            }
+            if (delta <= 0)
                 return;
-            if (gateSavingPerIter(c) <= 0)
-                return;
-            targets.push_back({forOp, c});
+            targets.push_back({forOp, delta});
         });
 
         if (targets.empty()) {
@@ -187,18 +186,17 @@ struct WidthGuardedMcxDecompPass
         }
 
         IRRewriter rewriter(&getContext());
-        for (auto &[forOp, c] : targets) {
-            emitGuardedDispatch(forOp, c, rewriter);
+        for (auto &[forOp, delta] : targets) {
+            emitGuardedDispatch(forOp, delta, rewriter);
         }
     }
 
     // Replace `forOp` with an scf.if on the symbolic cost, dispatching to a
-    // V-chain clone (then) or the ancilla-free clone (else).
-    void emitGuardedDispatch(scf::ForOp forOp, int64_t c, IRRewriter &rewriter)
+    // V-chain clone (then, all MCX rewritten) or the ancilla-free clone (else).
+    void emitGuardedDispatch(scf::ForOp forOp, int64_t delta, IRRewriter &rewriter)
     {
         rewriter.setInsertionPoint(forOp);
         Location loc = forOp.getLoc();
-        int64_t delta = gateSavingPerIter(c);
 
         // trip(N) = ceildiv(ub - lb, step)
         Value lb = forOp.getLowerBound(), ub = forOp.getUpperBound(), step = forOp.getStep();
@@ -216,14 +214,12 @@ struct WidthGuardedMcxDecompPass
             arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ugt, save, budget);
 
         Operation *rawFor = forOp.getOperation();
-        int64_t N = c;
         auto ifOp = scf::IfOp::create(
             rewriter, loc, fire,
-            [&](OpBuilder &b, Location l) { // then: V-chain version
+            [&](OpBuilder &b, Location l) { // then: V-chain version (all MCX)
                 Operation *cl = b.clone(*rawFor);
-                int64_t cc = 0;
-                CustomOp cmcx = findMcx(cast<scf::ForOp>(cl).getBodyRegion(), cc);
-                emitVChain(cmcx, N);
+                for (CustomOp cmcx : findAllMcx(cast<scf::ForOp>(cl).getBodyRegion()))
+                    emitVChain(cmcx, cmcx.getInCtrlQubits().size());
                 b.setInsertionPointAfter(cl);
                 scf::YieldOp::create(b, l, cl->getResults());
             },
