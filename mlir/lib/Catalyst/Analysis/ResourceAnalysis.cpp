@@ -323,12 +323,15 @@ void ResourceAnalysis::analyzeForLoop(scf::ForOp forOp, ResourceResult &result, 
         }
     }
 
+    uint64_t opHash = static_cast<uint64_t>(llvm::hash_value(forOp.getOperation()));
+
     if (tripCount.has_value()) {
         // Record the loop body under a new name (for_loop_1, …).
         // The parent stores how many times the loop runs.
         // Later, classical ops from that body are added into the parent, multiplied by that count.
         // The name is always new, so we don't overwrite an old entry.
         std::string name = makeUniqueSyntheticName("for_loop_", forLoopCounter);
+        loopBodyByHash[opHash] = {name, /*isDynamic=*/false};
         funcResults[name] = std::move(bodyResult);
         result.functionCalls[name] = tripCount.value();
         return;
@@ -337,9 +340,22 @@ void ResourceAnalysis::analyzeForLoop(scf::ForOp forOp, ResourceResult &result, 
     // Loop trip count is dynamic. Record the body under dyn_for_loop_<N>
     // and store a fixed number (hash) so each such loop has its own id in the output.
     std::string name = makeUniqueSyntheticName("dyn_for_loop_", dynForLoopCounter);
+    loopBodyByHash[opHash] = {name, /*isDynamic=*/true};
     funcResults[name] = std::move(bodyResult);
-    result.varFunctionCalls[name] = static_cast<uint64_t>(llvm::hash_value(forOp.getOperation()));
+    result.varFunctionCalls[name] = opHash;
     result.hasDynLoop = true;
+}
+
+const ResourceResult *ResourceAnalysis::getForLoopBody(mlir::Operation *forOp,
+                                                       bool &isDynamic) const
+{
+    auto it = loopBodyByHash.find(static_cast<uint64_t>(llvm::hash_value(forOp)));
+    if (it == loopBodyByHash.end()) {
+        return nullptr;
+    }
+    isDynamic = it->second.second;
+    auto rit = funcResults.find(it->second.first);
+    return rit == funcResults.end() ? nullptr : &rit->second;
 }
 
 void ResourceAnalysis::analyzeWhileLoop(scf::WhileOp whileOp, ResourceResult &result,

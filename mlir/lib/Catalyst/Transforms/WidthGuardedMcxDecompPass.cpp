@@ -14,41 +14,39 @@
 
 // WidthGuardedMcxDecompPass
 // ─────────────────────────
-// Selects the decomposition of a multi-controlled X gate
-// (`quantum.custom "PauliX"` with N control qubits) using the peak-qubit-width
-// reported by ResourceAnalysis, evaluated against a device `qubit-budget`.
+// Cost-gated, runtime-symbolic decomposition dispatch for a multi-controlled X
+// gate inside a for-loop with a RUNTIME trip count.
 //
-// The current program width is taken from the estimator (ResourceAnalysis's
-// value-semantics liveness -> ResourceResult::numQubits()); it is NOT a
-// hardcoded formula.  Emitting the V-chain adds the ladder's clean ancillas, so
-// the post-transform width is
+// Workflow:
+//   1. ResourceAnalysis classifies the `scf.for` as dynamic (runtime bound ⇒ the
+//      total cost is symbolic in the bound) and gives the per-iteration body.
+//   2. This pass synthesizes two versions of the loop body's MCX — ancilla-free
+//      (native op, O(c²) gates, 0 ancillas) and V-chain (2c-3 Toffolis on c-2
+//      clean ancillas) — and guards them with a SYMBOLIC cost expression:
 //
-//     currentWidth (from estimator) + nAncillas (ladder requirement)
+//        saving(N) = (g_af(c) - g_vc(c)) · trip(N)          // symbolic in N
+//        scf.if saving(N) > cost-budget { V-chain loop } else { ancilla-free loop }
 //
-// and the V-chain is emitted iff that fits `qubit-budget`; otherwise the
-// ancilla-free native op is left in place.
+//   trip(N) = ⌈(ub-lb)/step⌉ is materialized in IR from the loop operands, so the
+//   guard is evaluated at runtime once N is concrete.  The guard is a
+//   qubits-vs-gates trade: spend the V-chain's c-2 ancillas only when the loop is
+//   long enough that the accumulated gate saving justifies them.  Both branches
+//   are extensionally equal ⇒ no herald.
 //
-// The V-chain allocates N-2 clean ancillas (`quantum.alloc_qb`), computes an
-// AND-ladder into them, flips the target with the final ancilla, then uncomputes
-// the ladder so every ancilla returns to |0> before `quantum.dealloc_qb`.  The
-// transformation is extensionally equal to the original MCX.
+//   Static (compile-time-constant) loops are skipped: their decision is not
+//   symbolic, so a runtime guard is not warranted.
 //
-// Standard clean-ancilla V-chain (controls c[0..N-1], target t, ancillas
-// a[0..N-3]):
-//
-//   Toffoli(c[0],  c[1],   a[0])
-//   Toffoli(c[j+1], a[j-1], a[j])     for j = 1 .. N-3      (compute)
-//   Toffoli(c[N-1], a[N-3], t)                              (flip target)
-//   Toffoli(c[j+1], a[j-1], a[j])     for j = N-3 .. 1      (uncompute)
-//   Toffoli(c[0],  c[1],   a[0])
-//
-// Total: 2N-3 Toffolis, N-2 ancillas.
+// V-chain ladder (controls c[0..N-1], target t, ancillas a[0..N-3]):
+//   Toffoli(c0,c1,a0); Toffoli(c[j+1],a[j-1],a[j]) j=1..N-3; Toffoli(c[N-1],a[N-3],t);
+//   uncompute in reverse.  Total 2N-3 Toffolis, N-2 ancillas.
 
 #define DEBUG_TYPE "width-guarded-mcx-decomp"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
@@ -72,21 +70,15 @@ namespace catalyst {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// True iff `op` is a multi-controlled X we handle: gate "PauliX", a single
-// target, N>=3 positive controls, not adjoint.
+// True iff `op` is a multi-controlled X we handle: gate "PauliX", single target,
+// N>=3 positive (constant-true) controls, not adjoint.  Sets nControls.
 static bool isMultiControlledX(CustomOp op, int64_t &nControls)
 {
-    if (op.getGateName() != "PauliX")
-        return false;
-    if (op.getInQubits().size() != 1)
-        return false;
-    if (op.getAdjoint())
+    if (op.getGateName() != "PauliX" || op.getInQubits().size() != 1 || op.getAdjoint())
         return false;
     ValueRange ctrls = op.getInCtrlQubits();
     if (ctrls.size() < 3)
         return false;
-    // Require all control values to be constant `true` (positive controls); the
-    // V-chain ladder below assumes positive controls.
     for (Value cv : op.getInCtrlValues()) {
         APInt val;
         if (!matchPattern(cv, m_ConstantInt(&val)) || val.isZero())
@@ -96,63 +88,69 @@ static bool isMultiControlledX(CustomOp op, int64_t &nControls)
     return true;
 }
 
-// Emit a zero-parameter, no-control Toffoli on {a,b,c}; return its 3 out qubits.
-static SmallVector<Value, 3> toffoli(IRRewriter &rewriter, Location loc, Value a,
-                                     Value b, Value c)
+// First multi-controlled X in a region (the loop body's MCX), or null.
+static CustomOp findMcx(Region &region, int64_t &nControls)
 {
-    SmallVector<Value> qubits{a, b, c};
-    auto op = CustomOp::create(rewriter, loc, "Toffoli", ValueRange(qubits));
-    return SmallVector<Value, 3>(op.getOutQubits().begin(), op.getOutQubits().end());
+    CustomOp found;
+    region.walk([&](CustomOp op) {
+        int64_t n = 0;
+        if (!found && isMultiControlledX(op, n)) {
+            found = op;
+            nControls = n;
+            return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+    });
+    return found;
 }
 
-// Rewrite one multi-controlled X into its V-chain decomposition in place.
-static void emitVChain(CustomOp mcx, int64_t N, IRRewriter &rewriter)
+// Rewrite `mcx` into its V-chain Toffoli ladder in place (self-contained builder).
+static void emitVChain(CustomOp mcx, int64_t N)
 {
-    rewriter.setInsertionPoint(mcx);
+    OpBuilder builder(mcx); // insertion point immediately before mcx
     Location loc = mcx.getLoc();
 
-    // Working copies of the SSA values for controls and target.
     SmallVector<Value> c(mcx.getInCtrlQubits().begin(), mcx.getInCtrlQubits().end());
     Value t = mcx.getInQubits()[0];
 
-    // Allocate N-2 clean ancillas.
     int64_t nAnc = N - 2;
     SmallVector<Value> a(nAnc);
-    for (int64_t i = 0; i < nAnc; ++i) {
-        a[i] = AllocQubitOp::create(rewriter, loc).getOutQubit();
-    }
+    for (int64_t i = 0; i < nAnc; ++i)
+        a[i] = AllocQubitOp::create(builder, loc).getOutQubit();
 
     auto tof = [&](Value &x, Value &y, Value &z) {
-        auto r = toffoli(rewriter, loc, x, y, z);
-        x = r[0];
-        y = r[1];
-        z = r[2];
+        SmallVector<Value> q{x, y, z};
+        auto op = CustomOp::create(builder, loc, "Toffoli", ValueRange(q));
+        x = op.getOutQubits()[0];
+        y = op.getOutQubits()[1];
+        z = op.getOutQubits()[2];
     };
 
-    // ── compute ladder ──
-    tof(c[0], c[1], a[0]);                        // a[0] = c0 & c1
-    for (int64_t j = 1; j <= N - 3; ++j) {
-        tof(c[j + 1], a[j - 1], a[j]);            // a[j] = a[j-1] & c[j+1]
-    }
-    // ── flip target ──
-    tof(c[N - 1], a[nAnc - 1], t);                // t ^= a[N-3] & c[N-1]
-    // ── uncompute ladder ──
-    for (int64_t j = N - 3; j >= 1; --j) {
-        tof(c[j + 1], a[j - 1], a[j]);
-    }
+    tof(c[0], c[1], a[0]);                       // compute a[0] = c0 & c1
+    for (int64_t j = 1; j <= N - 3; ++j)
+        tof(c[j + 1], a[j - 1], a[j]);           // a[j] = a[j-1] & c[j+1]
+    tof(c[N - 1], a[nAnc - 1], t);               // flip target
+    for (int64_t j = N - 3; j >= 1; --j)
+        tof(c[j + 1], a[j - 1], a[j]);           // uncompute
     tof(c[0], c[1], a[0]);
 
-    // Ancillas are back to |0>; release them.
-    for (int64_t i = 0; i < nAnc; ++i) {
-        DeallocQubitOp::create(rewriter, loc, a[i]);
-    }
+    for (int64_t i = 0; i < nAnc; ++i)
+        DeallocQubitOp::create(builder, loc, a[i]);
 
-    // Rewire users of the MCX results to the ladder's final SSA values.
-    rewriter.replaceAllUsesWith(mcx.getOutQubits()[0], t);
-    for (int64_t i = 0; i < N; ++i) {
-        rewriter.replaceAllUsesWith(mcx.getOutCtrlQubits()[i], c[i]);
-    }
-    rewriter.eraseOp(mcx);
+    mcx.getOutQubits()[0].replaceAllUsesWith(t);
+    for (int64_t i = 0; i < N; ++i)
+        mcx.getOutCtrlQubits()[i].replaceAllUsesWith(c[i]);
+    mcx->erase();
+}
+
+// Per-iteration two-qubit-gate cost of each decomposition of a c-control X.
+//   ancilla-free : 24c² - 116c + 156   (validated fully-decomposed 2q count)
+//   V-chain      : 6·(2c-3) = 12c - 18  (2c-3 Toffolis, Toffoli = 6 two-qubit)
+static int64_t gateSavingPerIter(int64_t c)
+{
+    int64_t gAf = 24 * c * c - 116 * c + 156;
+    int64_t gVc = 12 * c - 18;
+    return gAf - gVc;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,38 +166,19 @@ struct WidthGuardedMcxDecompPass
         auto module = cast<ModuleOp>(getOperation());
         auto &analysis = getAnalysis<ResourceAnalysis>();
 
-        // Current peak qubit width of the program, from the estimator's
-        // value-semantics liveness (ResourceResult::numQubits()).  Taken as the
-        // max over all analysed functions so the register-allocating entry (or
-        // the widest loop body) dominates.  No width formula is assumed here.
-        int64_t currentWidth = 0;
-        for (const auto &entry : analysis.getResults()) {
-            currentWidth = std::max(currentWidth, entry.second.numQubits());
-        }
-        if (currentWidth == 0) {
-            // Estimator reported nothing; make no (unfounded) decision.
-            markAllAnalysesPreserved();
-            return;
-        }
-
-        // Collect MCX ops whose V-chain form fits the budget.  The only added
-        // width is the ladder's clean-ancilla requirement (nAnc = N-2), which is
-        // exactly the number of quantum.alloc_qb the emitter will issue.
-        SmallVector<std::pair<CustomOp, int64_t>> targets;
-        module.walk([&](CustomOp op) {
-            int64_t N = 0;
-            if (isMultiControlledX(op, N)) {
-                int64_t nAnc = N - 2;
-                int64_t postWidth = currentWidth + nAnc;
-                LLVM_DEBUG(llvm::dbgs()
-                           << "[" << DEBUG_TYPE << "] MCX N=" << N
-                           << " currentWidth=" << currentWidth
-                           << " +ancillas=" << nAnc << " -> postWidth=" << postWidth
-                           << " budget=" << qubitBudget << "\n");
-                if (postWidth <= qubitBudget) {
-                    targets.push_back({op, N});
-                }
-            }
+        // Collect dynamic-bound for-loops whose body holds a multi-controlled X.
+        SmallVector<std::pair<scf::ForOp, int64_t>> targets;
+        module.walk([&](scf::ForOp forOp) {
+            bool isDynamic = false;
+            const ResourceResult *body = analysis.getForLoopBody(forOp, isDynamic);
+            if (!body || !isDynamic) // only symbolic-bound loops get a runtime guard
+                return;
+            int64_t c = 0;
+            if (!findMcx(forOp.getBodyRegion(), c))
+                return;
+            if (gateSavingPerIter(c) <= 0)
+                return;
+            targets.push_back({forOp, c});
         });
 
         if (targets.empty()) {
@@ -208,9 +187,52 @@ struct WidthGuardedMcxDecompPass
         }
 
         IRRewriter rewriter(&getContext());
-        for (auto &[mcx, N] : targets) {
-            emitVChain(mcx, N, rewriter);
+        for (auto &[forOp, c] : targets) {
+            emitGuardedDispatch(forOp, c, rewriter);
         }
+    }
+
+    // Replace `forOp` with an scf.if on the symbolic cost, dispatching to a
+    // V-chain clone (then) or the ancilla-free clone (else).
+    void emitGuardedDispatch(scf::ForOp forOp, int64_t c, IRRewriter &rewriter)
+    {
+        rewriter.setInsertionPoint(forOp);
+        Location loc = forOp.getLoc();
+        int64_t delta = gateSavingPerIter(c);
+
+        // trip(N) = ceildiv(ub - lb, step)
+        Value lb = forOp.getLowerBound(), ub = forOp.getUpperBound(), step = forOp.getStep();
+        Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
+        Value diff = arith::SubIOp::create(rewriter, loc, ub, lb);
+        Value stepm1 = arith::SubIOp::create(rewriter, loc, step, one);
+        Value num = arith::AddIOp::create(rewriter, loc, diff, stepm1);
+        Value trip = arith::DivUIOp::create(rewriter, loc, num, step);
+
+        // saving(N) = delta * trip(N) ; fire iff saving > cost-budget
+        Value deltaC = arith::ConstantIndexOp::create(rewriter, loc, delta);
+        Value save = arith::MulIOp::create(rewriter, loc, deltaC, trip);
+        Value budget = arith::ConstantIndexOp::create(rewriter, loc, costBudget);
+        Value fire =
+            arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ugt, save, budget);
+
+        Operation *rawFor = forOp.getOperation();
+        int64_t N = c;
+        auto ifOp = scf::IfOp::create(
+            rewriter, loc, fire,
+            [&](OpBuilder &b, Location l) { // then: V-chain version
+                Operation *cl = b.clone(*rawFor);
+                int64_t cc = 0;
+                CustomOp cmcx = findMcx(cast<scf::ForOp>(cl).getBodyRegion(), cc);
+                emitVChain(cmcx, N);
+                b.setInsertionPointAfter(cl);
+                scf::YieldOp::create(b, l, cl->getResults());
+            },
+            [&](OpBuilder &b, Location l) { // else: ancilla-free (native) version
+                Operation *cl = b.clone(*rawFor);
+                scf::YieldOp::create(b, l, cl->getResults());
+            });
+
+        rewriter.replaceOp(forOp, ifOp.getResults());
     }
 };
 

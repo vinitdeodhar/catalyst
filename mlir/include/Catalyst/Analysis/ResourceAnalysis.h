@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Operation.h"
@@ -46,9 +47,18 @@ class ResourceAnalysis {
 
     const ResourceResult *getFlattenedResource(llvm::StringRef funcName) const;
 
+    // Per-iteration resource of a lifted for-loop body, looked up by the loop op.
+    // Returns nullptr if the op was not analysed as a for-loop. `isDynamic` is set
+    // to true when the loop's trip count is a runtime value (symbolic bound), i.e.
+    // the loop was lifted as `dyn_for_loop_*`; false for a static `for_loop_*`.
+    const ResourceResult *getForLoopBody(mlir::Operation *forOp, bool &isDynamic) const;
+
   private:
     // per-function resource counts
     llvm::StringMap<ResourceResult> funcResults;
+
+    // Loop op (by hash) -> lifted body name in `funcResults`, with dynamic flag.
+    llvm::DenseMap<uint64_t, std::pair<std::string, bool>> loopBodyByHash;
 
     // Flattened totals per function; filled on first `getFlattenedResource` call.
     mutable llvm::StringMap<ResourceResult> flattenedCache;

@@ -486,48 +486,45 @@ def EmptyPass : Pass<"empty"> {
 }
 
 def WidthGuardedMcxDecompPass : Pass<"width-guarded-mcx-decomp", "mlir::ModuleOp"> {
-    let summary = "Width-guarded decomposition selection for multi-controlled X gates.";
+    let summary = "Cost-gated runtime dispatch between two multi-controlled-X decompositions.";
     let description = [{
-        A multi-controlled `quantum.custom "PauliX"` with N control qubits has two
-        standard decompositions with a qubit-vs-gate trade-off:
+        For an `scf.for` with a RUNTIME trip count whose body applies a
+        multi-controlled `quantum.custom "PauliX"` (c controls), this pass emits a
+        symbolic, runtime-evaluated guard that dispatches between two decompositions
+        of the body's MCX:
 
-          - ancilla-free  : O(N^2) two-qubit gates, no extra qubits (native op left
-                            in place; lowered ancilla-free downstream).
-          - V-chain       : 2N-3 Toffolis on N-2 clean ancillas, i.e. O(N) —
-                            strictly cheaper on gates and depth, but needs the
-                            ancillas to fit the device.
+          - ancilla-free : O(c^2) two-qubit gates, 0 ancillas (native op kept).
+          - V-chain      : 2c-3 Toffolis on c-2 clean ancillas, i.e. O(c) gates.
 
-        The guard input is the program's peak qubit width as reported by
-        ResourceAnalysis (its value-semantics liveness), not a hardcoded formula.
-        Emitting the V-chain adds the ladder's N-2 clean ancillas, so the pass
-        emits it exactly when
+        ResourceAnalysis classifies the loop as dynamic (runtime bound, so the total
+        cost is symbolic in the bound) and provides the per-iteration body. The pass
+        then materializes, in IR, the SYMBOLIC gate saving as a function of the
+        runtime bound N and guards on it:
 
-            width(from ResourceAnalysis) + (N-2)  <=  qubit-budget
+            saving(N) = (g_af(c) - g_vc(c)) * trip(N)
+            scf.if saving(N) > cost-budget { V-chain loop } else { ancilla-free loop }
 
-        allocating the ancillas via `quantum.alloc_qb`, computing the AND-ladder,
-        flipping the target, and uncomputing the ladder so the ancillas return to
-        |0> before `quantum.dealloc_qb`.  Otherwise the multi-controlled op is left
-        untouched (ancilla-free path).
-        The two decompositions are extensionally equal (the V-chain uncomputes its
-        ancillas), so no herald / semantic contract is needed.
+        where trip(N) = ceildiv(ub-lb, step) is built from the loop operands. This is
+        a qubits-vs-gates trade evaluated at runtime: spend the V-chain's c-2 clean
+        ancillas only when the loop is long enough that the accumulated gate saving
+        exceeds `cost-budget`. Both branches are extensionally equal.
 
-        Only positive-control single-target PauliX ops with N >= 3 controls are
-        rewritten; adjoint or partially-negated controls are left untouched.
+        Static (compile-time-constant) loops are skipped -- their decision is not
+        symbolic. Only positive-control single-target PauliX with c >= 3 is handled.
 
         Usage:
-            quantum-opt input.mlir --width-guarded-mcx-decomp="qubit-budget=20"
+            quantum-opt input.mlir --width-guarded-mcx-decomp="cost-budget=4000"
     }];
 
     let options = [
         Option<
-            /*C++ var name=*/"qubitBudget",
-            /*CLI arg name=*/"qubit-budget",
+            /*C++ var name=*/"costBudget",
+            /*CLI arg name=*/"cost-budget",
             /*type=*/"int64_t",
             /*default=*/"0",
-            /*description=*/"Emit the V-chain decomposition for a multi-controlled X "
-                            "only when its peak width 2N-1 does not exceed this budget."
+            /*description=*/"Dispatch to the V-chain loop when the symbolic per-loop gate "
+                            "saving (g_af - g_vc) * trip(N) exceeds this budget."
         >
     ];
 }
-
 #endif // CATALYST_PASSES
