@@ -27,6 +27,8 @@ file(GLOB SRC
     RegisterInactiveCallbackPass.cpp
     ResourceAnalysisPass.cpp
     RegisterDecompRuleResourcePass.cpp
+    ResourceBudgetToffoliDecompPass.cpp
+    WidthGuardedMcxDecompPass.cpp
     SplitMultipleTapes.cpp
     TBAAPatterns.cpp
     TBAATagsPass.cpp

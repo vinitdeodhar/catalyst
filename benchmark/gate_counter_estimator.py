@@ -72,6 +72,8 @@ import pennylane as qp
 from catalyst import qjit
 from catalyst.pipelines import default_pipeline, insert_pass_after
 
+from runtime_model import DEFAULT_DEVICE, DeviceTimingModel, RuntimeEstimate
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -85,6 +87,8 @@ class RunResult:
     """Outcome of one instrumented circuit execution."""
     circuit_output: Any        # whatever the @qjit function returns
     gate_counts: GateCountDict # gate_label → count for this run
+    runtime_ns: float = 0.0    # modeled device runtime for this run (ns)
+    runtime: Optional[RuntimeEstimate] = None  # runtime with per-component breakdown
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +113,10 @@ class GateCounterSession:
     args :
         Fixed positional arguments forwarded to the circuit on every call.
     qnode_kwargs :
-        Extra kwargs forwarded to ``qp.QNode``.
+        Extra kwargs forwarded to ``qp.QNode``.  The reserved keyword
+        ``timing_model`` (a :class:`runtime_model.DeviceTimingModel`) is
+        consumed here rather than forwarded, and selects the device used to
+        model per-run runtime (default: IQM Garnet).
     """
 
     def __init__(
@@ -122,6 +129,13 @@ class GateCounterSession:
         self._circuit_fn = circuit_fn
         self._dev = dev
         self._fixed_args = args
+        self._timing_model: DeviceTimingModel = qnode_kwargs.pop(
+            "timing_model", DEFAULT_DEVICE
+        )
+        # Optional MLIR passes inserted after adjoint-lowering and *before* the
+        # gate-counter pass, so their rewritten gates are the ones counted
+        # (e.g. "width-guarded-mcx-decomp{qubit-budget=20}").
+        self._pre_passes = list(qnode_kwargs.pop("pre_instrumentation_passes", []))
         self._qnode_kwargs = qnode_kwargs
 
         self._manifest_path: Optional[str] = None
@@ -148,7 +162,13 @@ class GateCounterSession:
         self._reset_counters()
         result = self._compiled_fn(*call_args)
         counts = self._read_counters()
-        return RunResult(circuit_output=result, gate_counts=counts)
+        est = self._timing_model.runtime_ns(counts)
+        return RunResult(
+            circuit_output=result,
+            gate_counts=counts,
+            runtime_ns=est.total_ns,
+            runtime=est,
+        )
 
     # ── internals ──────────────────────────────────────────────────────────
 
@@ -168,7 +188,13 @@ class GateCounterSession:
         )
         for _name, passes in pipeline:
             if "adjoint-lowering" in passes:
-                insert_pass_after(passes, pass_name, "adjoint-lowering")
+                # Insert any pre-instrumentation passes first, then the counter
+                # pass after the last of them, preserving requested order.
+                anchor = "adjoint-lowering"
+                for p in self._pre_passes:
+                    insert_pass_after(passes, p, anchor)
+                    anchor = p
+                insert_pass_after(passes, pass_name, anchor)
                 break
 
         circuit_fn = self._circuit_fn

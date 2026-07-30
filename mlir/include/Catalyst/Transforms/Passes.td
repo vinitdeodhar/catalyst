@@ -333,6 +333,48 @@ def RegisterDecompRuleResourcePass : Pass<"register-decomp-rule-resource"> {
     }];
 }
 
+def ResourceBudgetToffoliDecompPass : Pass<"resource-budget-toffoli-decomp", "mlir::ModuleOp"> {
+    let summary = "Resource-guided Toffoli gate decomposition into CNOT+H+T primitives.";
+    let description = [{
+        Uses per-function CNOT pressure estimates from ResourceAnalysis to decide
+        whether to inline the standard 15-gate Toffoli decomposition
+        (H×2 + CNOT×6 + T×4 + T†×3, no ancilla, no relative phase).
+
+        CNOT pressure for a function = Σ (CNOT_count + 6 × Toffoli_count) over
+        all reachable callees (using the flattened resource view). Functions with
+        dynamic while-loops annotated with `estimated_iterations` include loop-body
+        costs scaled by the estimate; unannotated while-loop bodies are excluded
+        from the pressure calculation.
+
+        Functions whose flattened pressure exceeds `cnot-threshold` have every
+        `quantum.custom "Toffoli"` op replaced by its explicit 15-gate sequence.
+        Inlining exposes gate boundaries — especially across loop-iteration edges
+        after while-loop-peeling — to the cancel_inverses and merge_rotations
+        passes, enabling real gate-count reductions.
+
+        Toffoli ops with extra control qubits (in_ctrl_qubits non-empty) are
+        left untouched; they require higher-order decompositions.
+
+        Recommended pipeline position: after while-loop-peeling and before
+        cancel-inverses / merge-rotations.
+
+        Usage:
+            quantum-opt input.mlir --resource-budget-toffoli-decomp
+            quantum-opt input.mlir --resource-budget-toffoli-decomp="cnot-threshold=12"
+    }];
+
+    let options = [
+        Option<
+            /*C++ var name=*/"cnotThreshold",
+            /*CLI arg name=*/"cnot-threshold",
+            /*type=*/"int64_t",
+            /*default=*/"20",
+            /*description=*/"Decompose Toffoli gates in functions whose estimated CNOT "
+                            "pressure (CNOT_count + 6*Toffoli_count) exceeds this value."
+        >
+    ];
+}
+
 def GateCounterInstrumentationPass : Pass<"gate-counter-instrumentation", "mlir::ModuleOp"> {
     let summary = "Insert per-gate runtime counters into quantum circuits.";
     let description = [{
@@ -439,6 +481,50 @@ def EmptyPass : Pass<"empty"> {
             /*default=*/"\"\"",
             /*description=*/
             "Useful for storing metadata about the pass for inspectability."
+        >
+    ];
+}
+
+def WidthGuardedMcxDecompPass : Pass<"width-guarded-mcx-decomp", "mlir::ModuleOp"> {
+    let summary = "Width-guarded decomposition selection for multi-controlled X gates.";
+    let description = [{
+        A multi-controlled `quantum.custom "PauliX"` with N control qubits has two
+        standard decompositions with a qubit-vs-gate trade-off:
+
+          - ancilla-free  : peak width N+1, O(N^2) two-qubit gates (native op left
+                            in place; lowered ancilla-free downstream).
+          - V-chain       : peak width 2N-1 (N-2 clean ancillas), 2N-3 Toffolis,
+                            i.e. O(N) — strictly cheaper on gates and depth, but
+                            only usable when the ancillas fit the device.
+
+        This pass reads the symbolic peak width (exact at compile time, per the
+        value-semantics liveness of the resource analysis) and emits the V-chain
+        Toffoli ladder — allocating N-2 clean ancilla qubits via `quantum.alloc_qb`,
+        computing the AND-ladder, flipping the target, and uncomputing the ladder so
+        the ancillas return to |0> before `quantum.dealloc_qb` — exactly when the
+        V-chain fits the device budget:
+
+            2*N - 1  <=  qubit-budget
+
+        Otherwise the multi-controlled op is left untouched (ancilla-free path).
+        The two decompositions are extensionally equal (the V-chain uncomputes its
+        ancillas), so no herald / semantic contract is needed.
+
+        Only positive-control single-target PauliX ops with N >= 3 controls are
+        rewritten; adjoint or partially-negated controls are left untouched.
+
+        Usage:
+            quantum-opt input.mlir --width-guarded-mcx-decomp="qubit-budget=20"
+    }];
+
+    let options = [
+        Option<
+            /*C++ var name=*/"qubitBudget",
+            /*CLI arg name=*/"qubit-budget",
+            /*type=*/"int64_t",
+            /*default=*/"0",
+            /*description=*/"Emit the V-chain decomposition for a multi-controlled X "
+                            "only when its peak width 2N-1 does not exceed this budget."
         >
     ];
 }
