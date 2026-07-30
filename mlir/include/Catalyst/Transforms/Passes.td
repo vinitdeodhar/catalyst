@@ -527,4 +527,20 @@ def WidthGuardedMcxDecompPass : Pass<"width-guarded-mcx-decomp", "mlir::ModuleOp
         >
     ];
 }
+def QftApproxDispatchPass : Pass<"qft-approx-dispatch", "mlir::ModuleOp"> {
+    let summary = "Approximate-QFT aperture on a runtime-width QFT cascade (resource-estimator gated).";
+    let description = [{
+        Rewrites the inner controlled-phase cascade of a QFT whose register width
+        is a RUNTIME value: the inner loop upper bound n becomes min(n, i+b+1) with
+        b = ceil(log2 n) + 2 (Barenco-optimal aperture), so controlled-phase
+        rotations between qubits more than b apart -- below the noise floor -- are
+        skipped. b(n) >= n-1 for small n (bound stays n, exact QFT) and cuts once n
+        is large, so the aperture is self-dispatching in the runtime width.
+
+        Fires only on a dynamic (runtime-bound) inner loop whose body is a single
+        ControlledPhaseShift, as classified by ResourceAnalysis; static loops are
+        left alone.
+    }];
+}
+
 #endif // CATALYST_PASSES

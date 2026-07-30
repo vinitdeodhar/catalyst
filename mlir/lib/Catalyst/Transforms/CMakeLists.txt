@@ -29,6 +29,7 @@ file(GLOB SRC
     RegisterDecompRuleResourcePass.cpp
     ResourceBudgetToffoliDecompPass.cpp
     WidthGuardedMcxDecompPass.cpp
+    QftApproxDispatchPass.cpp
     SplitMultipleTapes.cpp
     TBAAPatterns.cpp
     TBAATagsPass.cpp
