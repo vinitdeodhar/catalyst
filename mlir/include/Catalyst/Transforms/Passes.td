@@ -543,4 +543,21 @@ def QftApproxDispatchPass : Pass<"qft-approx-dispatch", "mlir::ModuleOp"> {
     }];
 }
 
+def FreshAncillaAllocPass : Pass<"fresh-ancilla-alloc", "mlir::ModuleOp"> {
+    let summary = "Compile-time fresh-ancilla vs MCMR allocation for static syndrome loops.";
+    let description = [{
+        For a STATIC loop with a measure-and-reset (MCMR) ancilla (syndrome
+        extraction), replaces the reused-ancilla + reset with a fresh ancilla per
+        round (index c+i, reset dropped) when the ancillas fit `qubit-budget`:
+        `c + N <= qubit-budget`. Removes N rounds of reset/feedback latency at the
+        cost of N-1 extra qubits. A compile-time feasibility choice gated by the
+        estimator's static trip count N; runtime-bound loops are left untouched.
+    }];
+    let options = [
+        Option</*C++=*/"qubitBudget", /*CLI=*/"qubit-budget", /*type=*/"int64_t",
+               /*default=*/"0",
+               /*desc=*/"Use fresh ancillas only when c + N does not exceed this budget.">
+    ];
+}
+
 #endif // CATALYST_PASSES
