@@ -31,6 +31,7 @@ file(GLOB SRC
     WidthGuardedMcxDecompPass.cpp
     QftApproxDispatchPass.cpp
     FreshAncillaAllocPass.cpp
+    AdderAllocPass.cpp
     SplitMultipleTapes.cpp
     TBAAPatterns.cpp
     TBAATagsPass.cpp

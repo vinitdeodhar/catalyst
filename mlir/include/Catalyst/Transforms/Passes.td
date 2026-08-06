@@ -560,4 +560,22 @@ def FreshAncillaAllocPass : Pass<"fresh-ancilla-alloc", "mlir::ModuleOp"> {
     ];
 }
 
+def AdderAllocPass : Pass<"adder-alloc", "mlir::ModuleOp"> {
+    let summary = "Profile-guided adder-strategy allocation (ripple vs parallel) under a budget.";
+    let description = [{
+        Selects, per abstract `quantum.custom \"Adder\"` op (with a `width` attr),
+        ripple-carry vs parallel (carry-lookahead), under a global `ancilla-budget`,
+        weighted by each adder's execution count (enclosing static for trip counts x
+        the profiled E[k] of an enclosing measurement-driven while, via its
+        `estimated_iterations` attr). Adders sharing a critical-path level form an
+        all-or-nothing group; greedy over groups by (depth_saved x exec)/ancilla.
+        Sets each Adder's `strategy` ("ripple"/"parallel") and `ancillas`.
+        Depends on ResourceAnalysis for the loop structure.
+    }];
+    let options = [
+        Option</*C++=*/"qubitBudget", /*CLI=*/"ancilla-budget", /*type=*/"int64_t",
+               /*default=*/"0", /*desc=*/"Total ancillas available for parallel adders.">
+    ];
+}
+
 #endif // CATALYST_PASSES
