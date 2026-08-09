@@ -578,4 +578,23 @@ def AdderAllocPass : Pass<"adder-alloc", "mlir::ModuleOp"> {
     ];
 }
 
+def FactoredUnrollPass : Pass<"factored-unroll", "mlir::ModuleOp"> {
+    let summary = "Estimator-guided factored unrolling: strip-mine scf.for; speculative batch scf.while.";
+    let description = [{
+        Trades qubit width for depth / feedback latency by unrolling loops by a
+        factor F chosen to fit a qubit budget. scf.for: strip-mine (unroll body by
+        F, disjoint alloc_qb per clone). scf.while (RUS): speculative batch -- clone
+        the trial F times on disjoint ancillas, OR the success flags, select the
+        winning candidate (deallocating the F-1 losers). F = floor((qubit-budget -
+        W_target)/W_trial) from ResourceAnalysis, or explicit via unroll-factor.
+    }];
+    let options = [
+        Option</*C++=*/"unrollFactor", /*CLI=*/"unroll-factor", /*type=*/"int64_t",
+               /*default=*/"0", /*desc=*/"Explicit unroll factor F (0 = derive from qubit-budget).">,
+        Option</*C++=*/"qubitBudget", /*CLI=*/"qubit-budget", /*type=*/"int64_t",
+               /*default=*/"0", /*desc=*/"Total physical qubits; F = (budget - W_target)/W_trial.">
+    ];
+    let dependentDialects = ["mlir::scf::SCFDialect", "mlir::arith::ArithDialect"];
+}
+
 #endif // CATALYST_PASSES

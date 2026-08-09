@@ -32,6 +32,7 @@ file(GLOB SRC
     QftApproxDispatchPass.cpp
     FreshAncillaAllocPass.cpp
     AdderAllocPass.cpp
+    FactoredUnrollPass.cpp
     SplitMultipleTapes.cpp
     TBAAPatterns.cpp
     TBAATagsPass.cpp
