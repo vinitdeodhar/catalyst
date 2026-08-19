@@ -30,6 +30,7 @@ file(GLOB SRC
     IonsDecompositionPatterns.cpp
     loop_boundary_optimization.cpp
     LoopBoundaryOptimizationPatterns.cpp
+    loop_knitting.cpp
     reference_semantics_conversion.cpp
 )
 

@@ -218,6 +218,34 @@ def CombineGlobalPhasesPass : Pass<"combine-global-phases", "mlir::ModuleOp"> {
     let summary = "Scope-wise merging of global phase operators (safe).";
 }
 
+def LoopKnittingPass : Pass<"loop-knit"> {
+    let summary = "Coherent-depth bounding of carry-type dynamic while loops via inline cut-and-reprepare (loop knitting).";
+    let description = [{
+        Classifies measurement-conditioned scf.while loops as carry-type or
+        restart-type, computes the static body depth B, selects a cut period C
+        in the [C_min, C_max] window, and (for a single-carry, expval-output
+        carry loop) rewrites the loop to cut the carried wire every C failing
+        iterations, accumulating a quasi-probability weight. Emits knit.* attrs.
+    }];
+    let options = [
+        Option<"calib", "calib", "std::string", "\"unit\"",
+               "Calibration: 'unit' (layer counting) or a JSON file path.">,
+        Option<"pSuccess", "p", "double", "0.625",
+               "Per-iteration success probability (profiled or analytic).">,
+        Option<"cutPeriod", "C", "int", "-1",
+               "Cut period C; -1 selects C_min from the variance window.">,
+        Option<"budgetFraction", "f", "double", "0.05",
+               "Coherence budget fraction for C_max.">,
+        Option<"analyzeOnly", "analyze-only", "bool", "false",
+               "Only run analyses + emit knit.* attributes; do not rewrite.">,
+    ];
+    let dependentDialects = [
+        "scf::SCFDialect",
+        "tensor::TensorDialect",
+        "arith::ArithDialect",
+    ];
+}
+
 // ----- Quantum circuit transformation passes end ----- //
 
 #endif // QUANTUM_PASSES
