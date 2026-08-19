@@ -61,6 +61,9 @@ namespace {
 struct Calib {
     double gate1q = 1.0, gate2q = 1.0, readout = 1.0, tau = 1.0;
     double T1 = INFINITY, T2 = INFINITY;
+    // error probabilities for the profitability cost model (3.5)
+    double p1 = 0.0, p2 = 0.0, p_ro = 0.0, p_meas = 0.0;
+    double p_leak = 0.0, p_leak_ro = 0.0, p_prep = 0.0; // non-transportable
     bool unit = true; // layer counting
 
     static Calib load(StringRef spec)
@@ -91,6 +94,13 @@ struct Calib {
             c.tau = get("tau", 500e-9);
             c.T1 = get("T1", 150e-6);
             c.T2 = get("T2", 200e-6);
+            c.p1 = get("p1", 0.0);
+            c.p2 = get("p2", 0.0);
+            c.p_ro = get("p_ro", 0.0);
+            c.p_meas = get("p_meas", 0.0);
+            c.p_leak = get("p_leak", 0.0);
+            c.p_leak_ro = get("p_leak_ro", 0.0);
+            c.p_prep = get("p_prep", 0.0);
         }
         return c;
     }
@@ -680,7 +690,13 @@ static LoopInfo classify(scf::WhileOp loop)
 //===----------------------------------------------------------------------===//
 // Body depth B (Part 3.2)
 //===----------------------------------------------------------------------===//
-static double bodyDepth(scf::WhileOp loop, const Calib &c, bool condMeas)
+// Per-body-execution gate counts, for the profitability cost model (3.5).
+struct BodyStats {
+    int n1q = 0, n2q = 0, nro = 0;
+};
+
+static double bodyDepth(scf::WhileOp loop, const Calib &c, bool condMeas,
+                        BodyStats *stats = nullptr)
 {
     Block &body = loop.getAfter().front();
     llvm::DenseMap<Value, double> depth; // qubit/reg value -> depth
@@ -698,6 +714,8 @@ static double bodyDepth(scf::WhileOp loop, const Calib &c, bool condMeas)
                 for (Value q : custom.getInCtrlQubits())
                     base = std::max(base, d(q));
                 unsigned n = custom.getInQubits().size() + custom.getInCtrlQubits().size();
+                if (stats)
+                    (n >= 2 ? stats->n2q : stats->n1q)++;
                 double nd = base + c.gate(n);
                 for (Value q : custom.getOutQubits())
                     depth[q] = nd;
@@ -705,6 +723,8 @@ static double bodyDepth(scf::WhileOp loop, const Calib &c, bool condMeas)
                     depth[q] = nd;
             }
             else if (auto meas = dyn_cast<MeasureOp>(op)) {
+                if (stats)
+                    stats->nro++;
                 double nd = d(meas.getInQubit()) + c.readout;
                 depth[meas.getOutQubit()] = nd;
             }
@@ -764,6 +784,127 @@ static Window cutWindow(double p, double B, const Calib &c, double f)
     else
         cMax = (int)std::floor(f * c.T2 / (B + c.tau));
     return {cMin, cMax};
+}
+
+//===----------------------------------------------------------------------===//
+// Profitability cost model + strategy selection (Part 3.5). No DISCARD arm.
+//===----------------------------------------------------------------------===//
+enum class Strategy { None, Refresh, Knit };
+
+struct Predicted {
+    Strategy strat = Strategy::None;
+    int C = 0;
+    double none = 0, refresh = 0, knit = 0; // predicted expval errors
+};
+
+// per-iteration error rates split into transportable / non-transportable
+struct EpsRates {
+    double t = 0, nt = 0, cut = 0;
+    double all() const { return t + nt; }
+};
+static EpsRates epsFromCalib(const Calib &c, double Bsec, const BodyStats &bs)
+{
+    EpsRates e;
+    double idle = 0.0;
+    if (!std::isinf(c.T1) && !std::isinf(c.T2))
+        idle = (Bsec + c.tau) * (1.0 / c.T1 + 1.0 / c.T2);
+    // transportable: idle decoherence + gate depolarizing + pre-measure depol
+    e.t = idle + bs.n1q * c.p1 + bs.n2q * c.p2 + bs.nro * c.p_meas;
+    // non-transportable: leakage per 2q gate and per readout
+    e.nt = bs.n2q * c.p_leak + bs.nro * c.p_leak_ro;
+    // cut overhead: a readout + a state preparation
+    e.cut = c.p_ro + c.p_prep;
+    return e;
+}
+
+// expected age of the delivered state under cutting every C iterations (3.5)
+static double sbar(double p, int C)
+{
+    double s = 0.0, w;
+    for (int j = 1; j <= 200000; ++j) {
+        w = p * std::pow(1.0 - p, j - 1);
+        s += w * (double)(((j - 1) % C) + 1);
+        if (w < 1e-14 && j > 8)
+            break;
+    }
+    return s;
+}
+
+static double rmse(double bias, double stat) { return std::hypot(bias, stat); }
+
+// Select the profit-maximising strategy (3.5). tier1 = REFRESH is applicable.
+static Predicted selectStrategy(double p, const EpsRates &e, const Window &win,
+                                bool tier1, int shots, double sigma0,
+                                double margin, int forceC)
+{
+    Predicted r;
+    double Ek = 1.0 / p;
+    double statBase = sigma0 / std::sqrt((double)std::max(shots, 1));
+
+    // NONE
+    r.none = rmse(e.all() * Ek, statBase);
+
+    auto ecuts = [&](int C) {
+        double q = std::pow(1.0 - p, C);
+        return q / (1.0 - q);
+    };
+
+    // REFRESH (gamma = 1): C in [1, cMax], no variance floor
+    double bestRef = INFINITY;
+    int bestRefC = 0;
+    if (tier1) {
+        int lo = forceC > 0 ? forceC : 1;
+        int hi = forceC > 0 ? forceC : std::max(1, win.cMax);
+        for (int C = lo; C <= hi; ++C) {
+            double bias = e.all() * sbar(p, C) + ecuts(C) * e.cut;
+            double err = rmse(bias, statBase);
+            if (err < bestRef) {
+                bestRef = err;
+                bestRefC = C;
+            }
+        }
+    }
+    r.refresh = bestRef;
+
+    // KNIT (gamma = 4): C in [cMin, cMax], require 16 q < 1
+    double bestKnit = INFINITY;
+    int bestKnitC = 0;
+    {
+        int lo = forceC > 0 ? forceC : win.cMin;
+        int hi = forceC > 0 ? forceC : win.cMax;
+        for (int C = lo; C <= hi; ++C) {
+            double q = std::pow(1.0 - p, C);
+            if (16.0 * q >= 1.0)
+                continue; // divergent variance
+            double V = (1.0 - q) / (1.0 - 16.0 * q);
+            double bias = e.t * Ek + e.nt * sbar(p, C) + ecuts(C) * e.cut;
+            double stat = sigma0 * std::sqrt(V / (double)std::max(shots, 1));
+            double err = rmse(bias, stat);
+            if (err < bestKnit) {
+                bestKnit = err;
+                bestKnitC = C;
+            }
+        }
+    }
+    r.knit = bestKnit;
+
+    // decision: arg-min applicable strategy, fire iff it beats NONE by margin
+    double bestErr = INFINITY;
+    if (bestRef < bestErr) {
+        bestErr = bestRef;
+        r.strat = Strategy::Refresh;
+        r.C = bestRefC;
+    }
+    if (bestKnit < bestErr) {
+        bestErr = bestKnit;
+        r.strat = Strategy::Knit;
+        r.C = bestKnitC;
+    }
+    if (!(bestErr * margin < r.none)) {
+        r.strat = Strategy::None;
+        r.C = 0;
+    }
+    return r;
 }
 
 //===----------------------------------------------------------------------===//
@@ -958,72 +1099,108 @@ struct LoopKnittingPass : impl::LoopKnittingPassBase<LoopKnittingPass> {
         loop->setAttr("knit.carry_slot", b.getI64IntegerAttr(info.carrySlot));
 
         bool condMeas = conditionFromMeasure(loop);
-        double B = bodyDepth(loop, c, condMeas);
+        BodyStats bs;
+        double B = bodyDepth(loop, c, condMeas, &bs);
         if (c.unit)
             loop->setAttr("knit.body_layers", b.getF64FloatAttr(B));
         else
             loop->setAttr("knit.body_seconds", b.getF64FloatAttr(B));
 
-        // Cheap-cut analysis FIRST: can we prove the carried state is known?
-        // A deterministic (gamma = 1) cut has NO variance floor, so its window
-        // lower bound is 1 rather than the quasi-probability C_min.
+        // Tier-1 proof: can we prove the carried state is known (REFRESH, gamma=1)?
         FrameResult fr{Known::Unprovable, 'I'};
         PrepChain prep;
-        bool deterministic = false;
+        bool tier1 = false;
         if (info.carryArgIdx >= 0) {
             Value carriedArg =
                 loop.getAfter().front().getArgument(info.carryArgIdx);
             fr = proveKnownState(carriedArg, loop.getAfter().front());
             prep = captureInputPrep(loop.getInits()[info.carryArgIdx]);
-            deterministic = (fr.kind != Known::Unprovable) && prep.ok;
+            tier1 = (fr.kind != Known::Unprovable) && prep.ok;
             StringRef ks = fr.kind == Known::Identity     ? "identity"
                            : fr.kind == Known::KnownPauli ? "pauli"
                                                           : "none";
             loop->setAttr("knit.known_state", b.getStringAttr(ks));
-            loop->setAttr("knit.cut",
-                          b.getStringAttr(deterministic ? "deterministic"
-                                                        : "quasiprobability"));
         }
 
-        Window w = cutWindow(pSuccess, B, c, budgetFraction);
-        if (deterministic)
-            w.cMin = 1; // gamma = 1: variance floor lifted; bound depth tightly
-        if (w.empty()) {
-            loop.emitError("empty cut-period window: C_min=" + Twine(w.cMin) +
-                           " > C_max=" + Twine(w.cMax));
-            signalPassFailure();
-            return;
+        Window wKnit = cutWindow(pSuccess, B, c, budgetFraction);
+
+        // Strategy + cut-period selection.
+        Strategy strat;
+        int C = 0;
+        if (shots > 0) {
+            // Part 3.5: profitability model chooses NONE / REFRESH / KNIT and C.
+            EpsRates e = epsFromCalib(c, B, bs);
+            Predicted pred =
+                selectStrategy(pSuccess, e, wKnit, tier1, shots, sigma0, margin,
+                               cutPeriod > 0 ? cutPeriod : 0);
+            strat = pred.strat;
+            C = pred.C;
+            auto f = [&](double x) {
+                return b.getF64FloatAttr(std::isinf(x) ? -1.0 : x);
+            };
+            loop->setAttr("knit.predicted",
+                          b.getDictionaryAttr({
+                              b.getNamedAttr("none", f(pred.none)),
+                              b.getNamedAttr("refresh", f(pred.refresh)),
+                              b.getNamedAttr("knit", f(pred.knit)),
+                          }));
         }
-        // deterministic default: tightest useful bound (min(3, C_max)); quasi
-        // default: the variance floor C_min.
-        int Cdefault = deterministic ? std::min(3, w.cMax) : w.cMin;
-        int C = cutPeriod > 0 ? cutPeriod : Cdefault;
-        if (C < w.cMin || C > w.cMax) {
-            loop.emitError("requested C=" + Twine(C) + " outside window [" +
-                           Twine(w.cMin) + "," + Twine(w.cMax) + "]");
-            signalPassFailure();
-            return;
+        else {
+            // Legacy (no shot budget): fire the best available mechanism, no
+            // profitability veto. REFRESH if tier-1, else KNIT.
+            strat = tier1 ? Strategy::Refresh : Strategy::Knit;
+            int cMin = strat == Strategy::Refresh ? 1 : wKnit.cMin;
+            int cMax = wKnit.cMax;
+            if (cMin > cMax) {
+                loop.emitError("empty cut-period window: C_min=" + Twine(cMin) +
+                               " > C_max=" + Twine(cMax));
+                signalPassFailure();
+                return;
+            }
+            int Cdef = strat == Strategy::Refresh ? std::min(3, cMax) : cMin;
+            C = cutPeriod > 0 ? cutPeriod : Cdef;
+            if (C < cMin || C > cMax) {
+                loop.emitError("requested C=" + Twine(C) + " outside window [" +
+                               Twine(cMin) + "," + Twine(cMax) + "]");
+                signalPassFailure();
+                return;
+            }
         }
-        loop->setAttr("knit.C", b.getI64IntegerAttr(C));
-        loop->setAttr("knit.window",
-                      b.getDenseI64ArrayAttr({w.cMin, w.cMax}));
+
+        StringRef stratStr = strat == Strategy::None      ? "none"
+                             : strat == Strategy::Refresh ? "refresh"
+                                                          : "knit";
+        loop->setAttr("knit.strategy", b.getStringAttr(stratStr));
+        loop->setAttr("knit.cut",
+                      b.getStringAttr(strat == Strategy::Refresh ? "deterministic"
+                                      : strat == Strategy::Knit  ? "quasiprobability"
+                                                                 : "none"));
+        int wLo = strat == Strategy::Refresh ? 1 : wKnit.cMin;
+        if (strat != Strategy::None) {
+            loop->setAttr("knit.C", b.getI64IntegerAttr(C));
+            loop->setAttr("knit.window",
+                          b.getDenseI64ArrayAttr({wLo, wKnit.cMax}));
+        }
 
         if (analyzeOnly)
             return;
 
-        // Idempotence guard (Part 3.5)
+        // Idempotence guard
         if (loop->hasAttr("knit.applied"))
             return;
 
-        // Rewrite (Part 3.4 / cheap-cut). Fires only on a bare-qubit carry with
-        // expval output; register-threaded carries keep analyses only.
+        if (strat == Strategy::None) {
+            loop.emitRemark("loop-knit: not profitable; loop left unchanged");
+            return;
+        }
         if (info.carryArgIdx < 0) {
             loop.emitRemark("loop-knit: register-threaded carry; analyses only");
             return;
         }
-        bool ok = deterministic
-                      ? doRewriteDeterministic(loop, info.carryArgIdx, C, w, fr, prep)
-                      : doRewrite(loop, info.carryArgIdx, C, w);
+        Window wSel{wLo, wKnit.cMax};
+        bool ok = strat == Strategy::Refresh
+                      ? doRewriteDeterministic(loop, info.carryArgIdx, C, wSel, fr, prep)
+                      : doRewrite(loop, info.carryArgIdx, C, wSel);
         if (!ok)
             loop.emitRemark("loop-knit: output is not an expval of the carried "
                             "qubit; rewrite skipped");
@@ -1199,6 +1376,7 @@ struct LoopKnittingPass : impl::LoopKnittingPassBase<LoopKnittingPass> {
         nl->setAttr("knit.C", b.getI64IntegerAttr(C));
         nl->setAttr("knit.window", b.getDenseI64ArrayAttr({win.cMin, win.cMax}));
         nl->setAttr("knit.cut", b.getStringAttr("quasiprobability"));
+        nl->setAttr("knit.strategy", b.getStringAttr("knit"));
         nl->setAttr("knit.known_state", b.getStringAttr("none"));
         return true;
     }
@@ -1336,48 +1514,37 @@ struct LoopKnittingPass : impl::LoopKnittingPassBase<LoopKnittingPass> {
         Value counterRes = nl.getResult(nCarry); // i32 final trip count
         loop.erase();
 
-        // --- output legalization: weighted-free Z sample ---
-        b.setInsertionPoint(oc.obs);
-        Value dq = oc.obs.getQubit();
-        SmallVector<OpOperand *> otherUses;
-        for (OpOperand &u : dq.getUses())
-            if (u.getOwner() != oc.obs.getOperation())
-                otherUses.push_back(&u);
-        Value pre = dq;
-        if (oc.axis == 1)
-            pre = gate(b, loc, "Hadamard", dq);
-        else if (oc.axis == 2) {
-            Value s = gate(b, loc, "S", dq);
-            pre = gate(b, loc, "Hadamard", s);
-        }
-        auto mea = MeasureOp::create(b, loc, i1, qT, pre, IntegerAttr());
-        Value z = mea.getMres(), dfin = mea.getOutQubit();
-        Value fpos = arith::ConstantOp::create(b, loc, b.getF64FloatAttr(1.0));
-        Value fneg = arith::ConstantOp::create(b, loc, b.getF64FloatAttr(-1.0));
-        Value e = arith::SelectOp::create(b, loc, z, fneg, fpos);
-        // KnownPauli that anticommutes with the observable flips the sign by the
-        // final-counter parity: obs axis Z(0)/X(1)/Y(2); P in {X,Y,Z}.
-        bool anti = (fr.pauli == 'X' && oc.axis != 1) ||
-                    (fr.pauli == 'Y' && oc.axis != 2) ||
-                    (fr.pauli == 'Z' && oc.axis != 0);
-        if (knownPauli && anti) {
+        // --- output: REFRESH leaves the expval INTACT (Part 3.5). The carried
+        // qubit's final state is a genuine quantum state (refreshed to the ideal
+        // |psi0> each cut), so quantum.expval reads the right observable with no
+        // weight and no legalization. For KnownPauli, correct the delivered
+        // state by the counter parity before the observable.
+        if (knownPauli) {
+            b.setInsertionPoint(oc.obs);
+            Value dq = oc.obs.getQubit();
+            SmallVector<OpOperand *> uses; // namedobs + any post-loop insert
+            for (OpOperand &u : dq.getUses())
+                uses.push_back(&u);
             Value one = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(1));
             Value par = arith::AndIOp::create(b, loc, counterRes, one);
             Value pbit =
                 arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, par, one);
-            Value sgn = arith::SelectOp::create(b, loc, pbit, fneg, fpos);
-            e = arith::MulFOp::create(b, loc, e, sgn);
+            StringRef pName = fr.pauli == 'X'   ? "PauliX"
+                              : fr.pauli == 'Y' ? "PauliY"
+                                                : "PauliZ";
+            Value dqc = guarded(b, loc, pbit, dq,
+                                [&](OpBuilder &gb, Value in) {
+                                    return gate(gb, loc, pName, in);
+                                });
+            for (OpOperand *u : uses)
+                u->set(dqc); // namedobs/insert use the corrected qubit
         }
-        oc.expval.getExpval().replaceAllUsesWith(e);
-        for (OpOperand *u : otherUses)
-            u->set(dfin);
-        oc.expval.erase();
-        oc.obs.erase();
 
         nl->setAttr("knit.applied", b.getBoolAttr(true));
         nl->setAttr("knit.C", b.getI64IntegerAttr(C));
         nl->setAttr("knit.window", b.getDenseI64ArrayAttr({win.cMin, win.cMax}));
         nl->setAttr("knit.cut", b.getStringAttr("deterministic"));
+        nl->setAttr("knit.strategy", b.getStringAttr("refresh"));
         nl->setAttr("knit.known_state",
                     b.getStringAttr(knownPauli ? "pauli" : "identity"));
         return true;

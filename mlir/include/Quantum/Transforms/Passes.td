@@ -238,6 +238,12 @@ def LoopKnittingPass : Pass<"loop-knit"> {
                "Coherence budget fraction for C_max.">,
         Option<"analyzeOnly", "analyze-only", "bool", "false",
                "Only run analyses + emit knit.* attributes; do not rewrite.">,
+        Option<"shots", "shots", "int", "0",
+               "Shot budget S for the 3.5 profitability model; 0 disables it (fire the best available mechanism).">,
+        Option<"margin", "margin", "double", "1.5",
+               "Profitability margin: fire iff predicted*margin < predicted(NONE).">,
+        Option<"sigma0", "sigma0", "double", "1.0",
+               "Single-shot std for the statistical error term.">,
     ];
     let dependentDialects = [
         "scf::SCFDialect",
