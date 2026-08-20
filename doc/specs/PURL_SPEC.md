@@ -154,16 +154,18 @@ register-threaded qubits). The rewrite (3.5) fires on carry loops with an
 ### 3.0 `--purl` options (glossary)
 
 All options live on `--purl`; `--purl-lower-qcut` takes none (every decision they
-influence is already baked into the `quantum.qcut` op). Three provenance classes:
-**hardware** (from the calibration dataset / device), **compiler knobs** (genuine
-tuning), and **profile inputs** (properties of the *program/observable/run* —
-options here are a PoC shortcut; their target home is loop/observable attributes
-and the `@qjit` shot config, see §9).
+influence is already baked into the `quantum.qcut` op). Four provenance classes:
+**hardware** (device properties, from the calibration dataset), **placement** (the
+logical→physical wire binding, from mapping/routing — a *selector* into the
+hardware data, not a property), **compiler knobs** (genuine tuning), and **profile
+inputs** (properties of the *program/observable/run*). Placement and profile
+options are a PoC shortcut; their target home is a wire placement attribute,
+loop/observable attributes, and the `@qjit` shot config (see §9).
 
 | option | class | feeds | meaning |
 |---|---|---|---|
 | `calib` | hardware | 3.2, 3.5, 3.6 | Path to the hardware calibration JSON (§4). Single source for depth-in-seconds, cost model, and fidelity prediction. |
-| `carry-qubit` | hardware | 3.6 | Physical qubit index the carried wire maps to; selects the per-qubit T1/T2/1q-err/readout (and 2q-err from its edges). |
+| `carry-qubit` | placement | 3.6 | Physical qubit index the carried wire maps to — a *selector* into `calib`, not a property. Chooses the per-qubit T1/T2/1q-err/readout (and 2q-err from its edges). Passed as an **option because of pass ordering** (see note below), not because it is device data. |
 | `p-leak` | hardware | 3.5 | Leakage per 2q gate — a **separate knob** (IBM doesn't publish it, §4). The non-Markovian, reset-clearable error the cut actually reduces. |
 | `f` | compiler | 3.3 | Coherence-budget fraction for the window ceiling `C_max = floor(f·T2/(B+tau))`. |
 | `C` | compiler | 3.5 | Override the cut period instead of letting the cost model pick the arg-min over the window. |
@@ -178,6 +180,17 @@ Note: the cost model minimizes **ensemble-expected** error, which is why the
 profile inputs (esp. `p`) are load-bearing — they set the *expected* benefit/cost
 averaged over the trip distribution, not the cut period itself. A worst-case
 per-trajectory objective would need only `C_max` and could drop `p`.
+
+Note (`carry-qubit` and pass ordering): `--purl` runs **before** qubit placement/
+routing, so the logical→physical binding does not yet exist in the IR — hence it
+is supplied as an *option*, a representative/target-qubit hint for the §3.6
+prediction. This is deliberate: Purl *changes the circuit* (inserts measure+reset+
+re-prep, and KNIT adds ancillas), so it must run before placement and let a single
+downstream mapping pass route the final circuit. Were Purl placed *after* routing
+it could read the real physical qubit from a wire attribute (exact prediction), but
+its inserted ops would then need re-routing. The chosen order trades an exact qubit
+for a clean, single-pass placement; `carry-qubit` is the modeling stand-in for the
+not-yet-assigned qubit.
 
 ### 3.1 Classification (carry / restart / unknown)
 Walk each quantum slot of the `scf.while` carry (per-slot for a `!quantum.reg`
