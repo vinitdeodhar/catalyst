@@ -139,9 +139,8 @@ Purl is split into **two passes** so analysis and code-generation never mix:
 - **`--purl`** — the analysis + rewrite pass. It runs *all* of 3.1–3.6 (classify,
   depth, window, known-state proof, cost model, fidelity prediction) and **decides
   everything**; at each chosen cut site it emits a single high-level
-  **`quantum.qcut`** op (3.7) with every decision baked into it. Options: `calib`,
-  `p`, `C`, `f`, `shots`, `margin`, `sigma0`, `carry-qubit`, `p-leak`, `depth`,
-  `analyze-only`.
+  **`quantum.qcut`** op (3.7) with every decision baked into it. Options: see the
+  glossary in 3.0.
 - **`--purl-lower-qcut`** — a purely **mechanical** lowering (3.7) that expands
   each `quantum.qcut` into its concrete op sequence. It performs **no** analysis
   (no proof, no cost model) and reads only the op's own operands, attributes, and
@@ -151,6 +150,34 @@ The analyses (3.1–3.3) MUST handle the *actual Catalyst-emitted IR shape*
 (tensor-wrapped classical values, `stablehlo`/`tensor.extract` glue,
 register-threaded qubits). The rewrite (3.5) fires on carry loops with an
 `expval` output.
+
+### 3.0 `--purl` options (glossary)
+
+All options live on `--purl`; `--purl-lower-qcut` takes none (every decision they
+influence is already baked into the `quantum.qcut` op). Three provenance classes:
+**hardware** (from the calibration dataset / device), **compiler knobs** (genuine
+tuning), and **profile inputs** (properties of the *program/observable/run* —
+options here are a PoC shortcut; their target home is loop/observable attributes
+and the `@qjit` shot config, see §9).
+
+| option | class | feeds | meaning |
+|---|---|---|---|
+| `calib` | hardware | 3.2, 3.5, 3.6 | Path to the hardware calibration JSON (§4). Single source for depth-in-seconds, cost model, and fidelity prediction. |
+| `carry-qubit` | hardware | 3.6 | Physical qubit index the carried wire maps to; selects the per-qubit T1/T2/1q-err/readout (and 2q-err from its edges). |
+| `p-leak` | hardware | 3.5 | Leakage per 2q gate — a **separate knob** (IBM doesn't publish it, §4). The non-Markovian, reset-clearable error the cut actually reduces. |
+| `f` | compiler | 3.3 | Coherence-budget fraction for the window ceiling `C_max = floor(f·T2/(B+tau))`. |
+| `C` | compiler | 3.5 | Override the cut period instead of letting the cost model pick the arg-min over the window. |
+| `margin` | compiler | 3.5 | Profitability guard: cut fires iff `predicted·margin < predicted(NONE)`. |
+| `depth` | compiler | 3.6 | Report `purl.fidelity_at_depth` at this runtime depth `D` (`0` disables). |
+| `analyze-only` | compiler | all | Emit `purl.*` attributes without rewriting the IR (inspection/audit mode). |
+| `p` | profile | 3.3, 3.5 | RUS success probability per iteration → the trip distribution (`E[k]=1/p`, `C_min`, age `sbar(C)`, `E[#cuts]`). Not in the IR (the loop is unbounded-dynamic, §1.1). Sets the *expected payoff* of cutting, hence the NONE-vs-cut decision. |
+| `shots` | profile | 3.5 | `S`, the shot budget → the statistical term `sigma0/sqrt(S)` and the KNIT variance `sigma0·sqrt(V(C)/S)`. |
+| `sigma0` | profile | 3.5 | Per-shot standard deviation of the observable (≤1 for a Pauli); numerator of the statistical term. |
+
+Note: the cost model minimizes **ensemble-expected** error, which is why the
+profile inputs (esp. `p`) are load-bearing — they set the *expected* benefit/cost
+averaged over the trip distribution, not the cut period itself. A worst-case
+per-trajectory objective would need only `C_max` and could drop `p`.
 
 ### 3.1 Classification (carry / restart / unknown)
 Walk each quantum slot of the `scf.while` carry (per-slot for a `!quantum.reg`
