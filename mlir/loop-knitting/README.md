@@ -12,7 +12,7 @@ sim/
   fast_target.py   exact target-only fast path
   ibm_dataset.py   IBM Eagle r3 (127q) per-qubit + coupling dataset generator
   validate.py      simulator/estimator validation gates
-benchmarks/        rus_rx_ibm (p=5/8), rus_chain, heralded (low p) + ibm_eagle_r3.json
+benchmarks/        rus_rx_ibm (p=5/8), rus_chain, rus_lowp (low p) + ibm_eagle_r3.json
 eval/
   experiment.py    UNBOUNDED vs KNIT: depths + delivered fidelities (supports --ibm)
   run_eval.py      sweeps -> results/eval.csv
@@ -25,13 +25,13 @@ eval/
 cd mlir/loop-knitting
 PYTHONPATH=. python3 sim/ibm_dataset.py                 # write benchmarks/ibm_eagle_r3.json
 PYTHONPATH=. python3 sim/validate.py                    # validation gates
-PYTHONPATH=. python3 eval/experiment.py --bench heralded --ibm --carry-qubit 0
+PYTHONPATH=. python3 eval/experiment.py --bench rus_lowp --ibm --carry-qubit 0
 ```
 
 `eval/experiment.py --ibm` builds the simulator calibration from the carried
 qubit's real IBM Eagle r3 data (`--carry-qubit N`) plus the separate published
 leakage estimate (`--leak`, default ~1e-3), and reports unbounded vs the two
-knit cuts. On the low-p heralded loop this reproduces the pass's
+knit cuts. On the low-p (rus_lowp) loop this reproduces the pass's
 `knit.predicted_fidelity`: the deterministic gamma=1 refresh recovers several
 percent of delivered fidelity that idle decoherence costs the unbounded hold.
 

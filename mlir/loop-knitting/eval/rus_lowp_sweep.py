@@ -1,17 +1,17 @@
 """
-heralded_sweep.py -- does a low-p heralded loop (heavy trip-count tail) let
-knitting beat unbounded/discard? Sweeps the crossover for benchmarks/heralded at
-p = P_HERALD, and reports the pass cut-period window for a realistic vs a
+rus_lowp_sweep.py -- does a low-p heralded loop (heavy trip-count tail) let
+knitting beat unbounded/discard? Sweeps the crossover for benchmarks/rus_lowp at
+p = P_LOWP, and reports the pass cut-period window for a realistic vs a
 long-coherence (good-memory) device.
 
-Run:  PYTHONPATH=. python3 eval/heralded_sweep.py
+Run:  PYTHONPATH=. python3 eval/rus_lowp_sweep.py
 """
 
 import math
 import numpy as np
 
 from sim.fast_target import fast_unbounded, fast_truncated, fast_knit
-import benchmarks.heralded as herald
+import benchmarks.rus_lowp as bench
 
 # A good-memory device (long coherence) so the window can even open at low p;
 # leakage is the reset-clearable error the transform targets.
@@ -42,9 +42,9 @@ def arms(p, calib, C, lam, S, seeds):
         kn = [fast_knit(r, calib, lam, C, p=p) for _ in range(S)]
         zk = [e for e, _, _, _ in kn]
         ncut = sum(1 for _, _, nc, _ in kn if nc > 0)
-        Eu.append(abs(np.mean(zu) - herald.Z_IDEAL))
-        Ed.append(abs(np.mean(kept) - herald.Z_IDEAL) if kept else np.nan)
-        Ek.append(abs(np.mean(zk) - herald.Z_IDEAL))
+        Eu.append(abs(np.mean(zu) - bench.Z_IDEAL))
+        Ed.append(abs(np.mean(kept) - bench.Z_IDEAL) if kept else np.nan)
+        Ek.append(abs(np.mean(zk) - bench.Z_IDEAL))
         cr.append(ncut / S)
         dr.append(ntr / S)
     return (np.nanmean(Eu), np.nanmean(Ed), np.nanmean(Ek),
@@ -52,9 +52,9 @@ def arms(p, calib, C, lam, S, seeds):
 
 
 def main():
-    p = herald.P_HERALD
+    p = bench.P_LOWP
     mean_k = 1.0 / p
-    print(f"heralded benchmark: p = {p}  (mean trip count 1/p = {mean_k:.0f})")
+    print(f"rus_lowp benchmark: p = {p}  (mean trip count 1/p = {mean_k:.0f})")
 
     cmin_r, cmax_r = window(p, REALISTIC)
     cmin_g, cmax_g = window(p, GOOD_MEM)

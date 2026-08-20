@@ -14,7 +14,7 @@ in the tail). Knit: it is capped at the cut period C, by construction.
 
 Usage:
   PYTHONPATH=. python3 eval/experiment.py                # rus_rx_ibm (p=5/8)
-  PYTHONPATH=. python3 eval/experiment.py --bench heralded
+  PYTHONPATH=. python3 eval/experiment.py --bench rus_lowp
 Outputs results/experiment.csv.
 """
 
@@ -33,9 +33,9 @@ IDEAL_BLOCH = np.array([1 / math.sqrt(2), 0.5, 0.5])  # H T H T H |0>
 
 # body depth B in gate-layers per loop body (pass `knit.body_layers` on the
 # Catalyst-emitted IR). rus_rx_ibm = the IBM 2-control Toffoli body.
-B_LAYERS = {"rus_rx_ibm": 12, "heralded": 12}
+B_LAYERS = {"rus_rx_ibm": 12, "rus_lowp": 12}
 
-# a good-memory device so the window opens at low p (heralded); rus uses EVAL_CALIB
+# a good-memory device so the window opens at low p (rus_lowp); rus uses EVAL_CALIB
 GOOD_MEM = dict(gate_1q=30e-9, gate_2q=60e-9, readout=1e-6, tau=1e-6,
                 T1=8e-3, T2=8e-3, p1=2e-4, p2=1e-3, p_ro=2e-3, p_meas=1e-3,
                 T_leak=4e-3)
@@ -76,7 +76,7 @@ def depths(calib, lam, p, S, seeds):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", default="rus_rx_ibm",
-                    choices=["rus_rx_ibm", "heralded"])
+                    choices=["rus_rx_ibm", "rus_lowp"])
     ap.add_argument("-S", type=int, default=6000)
     ap.add_argument("--seeds", type=int, default=8)
     ap.add_argument("--ibm", action="store_true",
@@ -88,8 +88,8 @@ def main():
                          "(--ibm; default = published IBM estimate)")
     args = ap.parse_args()
 
-    if args.bench == "heralded":
-        import benchmarks.heralded as bench
+    if args.bench == "rus_lowp":
+        import benchmarks.rus_lowp as bench
         p = bench.P_ANALYTIC
     else:
         import benchmarks.rus_rx_ibm as bench
@@ -106,8 +106,8 @@ def main():
         calib["T_leak"] = dt / leak if leak > 0 else float("inf")
         src = f"IBM Eagle r3 (qubit {args.carry_qubit}, leak/iter={leak:g})"
     else:
-        calib = GOOD_MEM if args.bench == "heralded" else EVAL_CALIB
-        src = "held-memory device" if args.bench == "heralded" else "leakage-dominated"
+        calib = GOOD_MEM if args.bench == "rus_lowp" else EVAL_CALIB
+        src = "held-memory device" if args.bench == "rus_lowp" else "leakage-dominated"
     B = B_LAYERS[args.bench]
     C_min, C_max = window(p, calib=calib)
     C = C_min          # quasi (gamma=4) cut: bounded by the variance floor C_min
