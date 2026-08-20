@@ -335,26 +335,194 @@ internal refactor with no change to the final IR, while giving a stable,
 inspectable `quantum.qcut` level in between (useful for `--analyze-only` dumps and
 for testing insertion and expansion independently, §7).
 
+**Worked example (REFRESH).** Simplified IR — real Catalyst IR wraps classical
+values in tensors + `stablehlo`/`tensor.extract`; elided here.
+
+*(a) Input — before `--purl`.* A carry loop that holds `|psi0>` and repeats until
+an ancilla heralds success; the carried wire takes gates but is never measured.
+
+```mlir
+func.func @rus() -> f64 {
+  %q0 = ...                                   // prepare |psi0> on the carried wire
+  %qf = scf.while (%q = %q0) : (!quantum.bit) -> !quantum.bit {
+  ^before(%q: !quantum.bit):
+    %q1, %m = ...                             // RUS body: entangle %q w/ fresh
+                                              // ancilla, measure ANCILLA -> %m
+    %fail = arith.cmpi eq, %m, %false : i1    // continue while not heralded
+    scf.condition(%fail) %q1 : !quantum.bit
+  } do {
+  ^after(%q: !quantum.bit):
+    scf.yield %q : !quantum.bit
+  }
+  %obs = quantum.namedobs %qf[PauliZ] : !quantum.obs
+  %e   = quantum.expval %obs : f64
+  return %e : f64
+}
+```
+
+*(b) After `--purl` (= input to `--purl-lower-qcut`).* An `i32` counter is threaded
+through the carry; the failing branch gets an `if counter==C` guard holding one
+self-contained `quantum.qcut`. Analyses land as `purl.*` attributes.
+
+```mlir
+func.func @rus() -> f64
+    attributes { purl.class = "carry", purl.known_state = "identity",
+                 purl.strategy = "refresh", purl.C = 8 : i32,
+                 purl.window = [1, 12], purl.applied } {
+  %q0 = ...                                   // prepare |psi0>
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %cC = arith.constant 8 : i32
+  %qf, %cf = scf.while (%q = %q0, %ctr = %c0)
+      : (!quantum.bit, i32) -> (!quantum.bit, i32) {
+  ^before(%q: !quantum.bit, %ctr: i32):
+    %q1, %m = ...                             // same RUS body
+    %fail = arith.cmpi eq, %m, %false : i1
+    scf.condition(%fail) %q1, %ctr : !quantum.bit, i32
+  } do {
+  ^after(%q: !quantum.bit, %ctr: i32):        // runs only on a FAILING iteration
+    %ctr1 = arith.addi %ctr, %c1 : i32
+    %hit  = arith.cmpi eq, %ctr1, %cC : i32
+    %qn, %ctrn = scf.if %hit -> (!quantum.bit, i32) {
+      %qr = quantum.qcut %q { strategy = "refresh" }
+              prep { ^bb0(%fresh: !quantum.bit):    // reproduces |psi0>
+                     %p = ... ; quantum.yield %p : !quantum.bit }
+            : (!quantum.bit) -> !quantum.bit
+      scf.yield %qr, %c0 : !quantum.bit, i32        // refreshed + counter reset
+    } else {
+      scf.yield %q, %ctr1 : !quantum.bit, i32
+    }
+    scf.yield %qn, %ctrn : !quantum.bit, i32
+  }
+  %obs = quantum.namedobs %qf[PauliZ] : !quantum.obs
+  %e   = quantum.expval %obs : f64              // expval SURVIVES (refresh, no legalize)
+  return %e : f64
+}
+```
+
+*(c) After `--purl-lower-qcut`.* The `quantum.qcut` is mechanically expanded to
+measure + reset + inline the `prep` region (γ=1; the measured value is discarded —
+the noisy state is thrown away and the ideal `|psi0>` re-prepared). Only the guarded
+`scf.if` changes; everything else is byte-identical to (b).
+
+```mlir
+    %qn, %ctrn = scf.if %hit -> (!quantum.bit, i32) {
+      // quantum.qcut{refresh} expands to: measure (discard) -> reset -> inline prep
+      %m2, %qm = quantum.measure %q : i1, !quantum.bit
+      %qz = scf.if %m2 -> (!quantum.bit) {          // conditional-X reset -> |0>
+        %x = quantum.custom "PauliX"() %qm : !quantum.bit
+        scf.yield %x : !quantum.bit
+      } else {
+        scf.yield %qm : !quantum.bit
+      }
+      %qr = ...                                     // inlined prep region -> |psi0>
+      scf.yield %qr, %c0 : !quantum.bit, i32
+    } else {
+      scf.yield %q, %ctr1 : !quantum.bit, i32
+    }
+```
+
+(The KNIT lowering instead threads an `f64` weight and expands to `@purl_sample_term`
+→ basis change → measure → reset → eigenstate prep → `4·sigma·s` weight fold, and
+the `expval` in (b) is legalized to a weighted-Z sample.)
+
 ---
 
 ## 4. The shared IBM hardware dataset (one JSON, two consumers)
 
 `ibm_eagle_r3.json` — a 127-qubit **IBM Eagle r3** dataset with representative
-published medians and a deterministic per-qubit spread:
+published medians and a deterministic per-qubit spread. The **same file** feeds
+(a) the pass's depth-in-seconds, cost model, and fidelity prediction, and (b) the
+simulator's noise model (§5). A generator writes the JSON deterministically; a
+loader validates it and extracts a flat per-carried-qubit calibration.
 
-- top level: `gate_1q_time`, `gate_2q_time`, `readout_time`, `tau`, `p_prep`;
-- `qubits[]`: per-qubit `T1`, `T2`, `gate_1q_err`, `readout_err`;
-- `edges[]`: heavy-hex coupling map with per-edge `gate_2q_err`.
+### 4.1 Schema
+
+All times are **SI seconds**; all error/probability fields are dimensionless in
+`[0,1]`. Unknown extra keys are ignored (forward-compatible).
+
+| field | where | type | unit | meaning |
+|---|---|---|---|---|
+| `backend` | top | string | — | device label, e.g. `"ibm_eagle_r3"` |
+| `n_qubits` | top | int ≥ 1 | — | must equal `len(qubits)` |
+| `units` | top | string | — | must be `"SI"` (guards against µs/ns mixups) |
+| `gate_1q_time` | top | float > 0 | s | 1q (sx) gate duration |
+| `gate_2q_time` | top | float > 0 | s | 2q (ECR) gate duration |
+| `readout_time` | top | float > 0 | s | mid-circuit measurement duration |
+| `tau` | top | float ≥ 0 | s | classical feedback latency (§3.0 note) |
+| `p_prep` | top | float ∈ [0,1] | — | reset/state-prep error |
+| `qubits[i].T1` | per-qubit | float > 0 | s | amplitude-damping time |
+| `qubits[i].T2` | per-qubit | float > 0 | s | dephasing time (**≤ 2·T1**) |
+| `qubits[i].gate_1q_err` | per-qubit | float ∈ [0,1] | — | 1q depolarizing error |
+| `qubits[i].readout_err` | per-qubit | float ∈ [0,1] | — | readout bit-flip prob |
+| `edges[k].q` | per-edge | `[int,int]` | — | undirected pair, `0 ≤ i<j < n_qubits` |
+| `edges[k].gate_2q_err` | per-edge | float ∈ [0,1] | — | 2q depolarizing error |
+
+**Leakage is deliberately absent** — IBM does not publish it, and putting a
+guessed value in the dataset would let it be silently double-counted. It enters
+only as the separate `p-leak` knob (published estimate ~1e-3 per 2q gate) supplied
+to *both* the pass and the simulator; a loader that finds a `leakage`/`p_leak` key
+in the file **errors** (to force the single-source convention).
+
+### 4.2 Validation (loader-enforced)
+
+The loader rejects a file (hard error) unless:
+
+1. `n_qubits == len(qubits)` and `n_qubits ≥ 1`; `units == "SI"`.
+2. every top-level time is `> 0`; `tau ≥ 0`; `p_prep ∈ [0,1]`.
+3. every per-qubit `T1,T2 > 0` and **`T2 ≤ 2·T1`** (physical; the pure-dephasing
+   rate `1/T2 = 1/(2 T1) + 1/T_phi` must be non-negative); `gate_1q_err`,
+   `readout_err ∈ [0,1]`.
+4. every edge `q=[i,j]` has `0 ≤ i < j < n_qubits`; no duplicate undirected pair;
+   `gate_2q_err ∈ [0,1]`.
+5. no `leakage`/`p_leak` key present (see §4.1).
+
+Non-fatal **warnings**: a disconnected coupling map; a qubit with no incident edge
+(its 2q error then falls back to the global median `gate_2q_err`); any per-qubit
+value deviating > 10× from the stated medians (typo guard).
+
+The `--purl` `carry-qubit` index is validated against this file: it must satisfy
+`0 ≤ carry-qubit < n_qubits`, else the pass errors. **Loader → flat calib:** for
+the chosen qubit `k` it emits `{T1,T2,gate_1q_err,readout_err}` from `qubits[k]`,
+`gate_2q_err` = median over edges incident to `k` (global median if isolated), plus
+the top-level times/`tau`/`p_prep`. That flat dict is exactly what `Calib::load`
+and the simulator consume.
+
+### 4.3 Complete valid example
 
 Representative medians: T1 ~ 250 µs, T2 ~ 150 µs, sx 1q-err ~ 2.5e-4 (32 ns),
-ECR 2q-err ~ 8e-3 (560 ns), readout-err ~ 1.3e-2 (1.2 µs), tau ~ 1 µs.
-**Leakage is NOT in the dataset** (IBM does not publish it) — it is a separate
-knob `p-leak` (published estimate ~1e-3 per 2q gate) supplied to both the pass
-and the simulator.
+ECR 2q-err ~ 8e-3 (560 ns), readout-err ~ 1.3e-2 (1.2 µs), tau ~ 1 µs. A complete,
+schema-valid instance (5 qubits on a path; the shipped file scales this to
+`n_qubits = 127` with a heavy-hex `edges` map, generated deterministically):
 
-The **same file** feeds (a) the pass's depth-in-seconds, cost model, and fidelity
-prediction, and (b) the simulator's noise model (§5). A generator writes the JSON
-deterministically; a loader extracts a flat per-carried-qubit calibration.
+```json
+{
+  "backend": "ibm_eagle_r3",
+  "n_qubits": 5,
+  "units": "SI",
+  "gate_1q_time": 3.2e-8,
+  "gate_2q_time": 5.6e-7,
+  "readout_time": 1.2e-6,
+  "tau": 1.0e-6,
+  "p_prep": 1.0e-3,
+  "qubits": [
+    { "T1": 2.51e-4, "T2": 1.48e-4, "gate_1q_err": 2.4e-4, "readout_err": 1.30e-2 },
+    { "T1": 2.33e-4, "T2": 1.61e-4, "gate_1q_err": 2.6e-4, "readout_err": 1.42e-2 },
+    { "T1": 2.68e-4, "T2": 1.39e-4, "gate_1q_err": 2.5e-4, "readout_err": 1.11e-2 },
+    { "T1": 2.19e-4, "T2": 1.52e-4, "gate_1q_err": 2.7e-4, "readout_err": 1.55e-2 },
+    { "T1": 2.60e-4, "T2": 1.44e-4, "gate_1q_err": 2.3e-4, "readout_err": 1.20e-2 }
+  ],
+  "edges": [
+    { "q": [0, 1], "gate_2q_err": 7.8e-3 },
+    { "q": [1, 2], "gate_2q_err": 8.4e-3 },
+    { "q": [2, 3], "gate_2q_err": 9.1e-3 },
+    { "q": [3, 4], "gate_2q_err": 7.2e-3 }
+  ]
+}
+```
+
+(Every qubit above satisfies `T2 ≤ 2·T1`; every edge indexes a valid pair — the
+file passes §4.2.)
 
 ---
 
