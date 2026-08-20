@@ -192,6 +192,15 @@ its inserted ops would then need re-routing. The chosen order trades an exact qu
 for a clean, single-pass placement; `carry-qubit` is the modeling stand-in for the
 not-yet-assigned qubit.
 
+Note (dataset-sourced hardware, not options): not every model input is an option.
+The per-iteration classical **feedback latency `tau`** (the readout→controller→
+condition→dispatch round-trip the carried wire idles through each dynamic
+iteration) and the state-prep error `p_prep` arrive via the `calib` file — both are
+**top-level, control-system properties** (not per-qubit), so they ride in with
+`calib`/`carry-qubit` rather than as their own knobs. `tau` enters `B+tau`
+everywhere it matters: body cost (3.2), the window ceiling `C_max` (3.3), and the
+idle time `t_idle=D·(B+tau)` (3.6).
+
 ### 3.1 Classification (carry / restart / unknown)
 Walk each quantum slot of the `scf.while` carry (per-slot for a `!quantum.reg`
 via extract/insert indices; or a bare `!quantum.bit`). A slot is:
