@@ -244,6 +244,12 @@ def LoopKnittingPass : Pass<"loop-knit"> {
                "Profitability margin: fire iff predicted*margin < predicted(NONE).">,
         Option<"sigma0", "sigma0", "double", "1.0",
                "Single-shot std for the statistical error term.">,
+        Option<"carryQubit", "carry-qubit", "int", "0",
+               "Physical qubit index for the carried wire when calib is a per-qubit hardware dataset.">,
+        Option<"pLeak", "p-leak", "double", "0.0",
+               "Leakage per 2q gate on the carried wire (separate knob; not in the IBM dataset).">,
+        Option<"depth", "depth", "int", "-1",
+               "If >0, also emit knit.fidelity_at_depth for this many loop iterations.">,
     ];
     let dependentDialects = [
         "scf::SCFDialect",

@@ -19,6 +19,7 @@
 
 #define DEBUG_TYPE "loop-knit"
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <optional>
@@ -66,41 +67,73 @@ struct Calib {
     double p_leak = 0.0, p_leak_ro = 0.0, p_prep = 0.0; // non-transportable
     bool unit = true; // layer counting
 
-    static Calib load(StringRef spec)
+    static Calib load(StringRef spec, int qubit = 0, double pLeak = 0.0)
     {
         Calib c;
         if (spec == "unit" || spec.empty())
             return c;
         c.unit = false;
         auto buf = llvm::MemoryBuffer::getFile(spec);
-        if (!buf) {
-            // fall back to unit weights on a missing file
-            return Calib{};
-        }
+        if (!buf)
+            return Calib{}; // fall back to unit weights on a missing file
         auto parsed = llvm::json::parse((*buf)->getBuffer());
         if (!parsed) {
             llvm::consumeError(parsed.takeError());
             return Calib{};
         }
-        if (auto *obj = parsed->getAsObject()) {
-            auto get = [&](StringRef k, double dflt) -> double {
-                if (auto v = obj->getNumber(k))
+        auto *obj = parsed->getAsObject();
+        if (!obj)
+            return c;
+        auto get = [&](llvm::json::Object *o, StringRef k, double dflt) -> double {
+            if (o)
+                if (auto v = o->getNumber(k))
                     return *v;
-                return dflt;
-            };
-            c.gate1q = get("gate_1q", 30e-9);
-            c.gate2q = get("gate_2q", 60e-9);
-            c.readout = get("readout", 700e-9);
-            c.tau = get("tau", 500e-9);
-            c.T1 = get("T1", 150e-6);
-            c.T2 = get("T2", 200e-6);
-            c.p1 = get("p1", 0.0);
-            c.p2 = get("p2", 0.0);
-            c.p_ro = get("p_ro", 0.0);
-            c.p_meas = get("p_meas", 0.0);
-            c.p_leak = get("p_leak", 0.0);
-            c.p_leak_ro = get("p_leak_ro", 0.0);
-            c.p_prep = get("p_prep", 0.0);
+            return dflt;
+        };
+        if (auto *qubits = obj->getArray("qubits")) {
+            // per-qubit + coupling-map hardware dataset (e.g. IBM Eagle r3):
+            // pull the carried wire's physical qubit and the median 2q error.
+            c.gate1q = get(obj, "gate_1q_time", 32e-9);
+            c.gate2q = get(obj, "gate_2q_time", 560e-9);
+            c.readout = get(obj, "readout_time", 1.2e-6);
+            c.tau = get(obj, "tau", 1e-6);
+            c.p_prep = get(obj, "p_prep", 0.0);
+            unsigned qi = (qubit >= 0 && (unsigned)qubit < qubits->size()) ? qubit : 0;
+            auto *q = (*qubits)[qi].getAsObject();
+            c.T1 = get(q, "T1", 250e-6);
+            c.T2 = get(q, "T2", 150e-6);
+            c.p1 = get(q, "gate_1q_err", 0.0);
+            c.p_meas = get(q, "gate_1q_err", 0.0);
+            c.p_ro = get(q, "readout_err", 0.0);
+            // median 2q error over the coupling map
+            SmallVector<double> e2;
+            if (auto *edges = obj->getArray("edges"))
+                for (auto &e : *edges)
+                    if (auto *eo = e.getAsObject())
+                        if (auto v = eo->getNumber("gate_2q_err"))
+                            e2.push_back(*v);
+            if (!e2.empty()) {
+                std::sort(e2.begin(), e2.end());
+                c.p2 = e2[e2.size() / 2];
+            }
+            c.p_leak = pLeak;             // separate knob (not in the dataset)
+            c.p_leak_ro = pLeak * 0.5;
+        }
+        else {
+            // flat calibration (durations + rates)
+            c.gate1q = get(obj, "gate_1q", 30e-9);
+            c.gate2q = get(obj, "gate_2q", 60e-9);
+            c.readout = get(obj, "readout", 700e-9);
+            c.tau = get(obj, "tau", 500e-9);
+            c.T1 = get(obj, "T1", 150e-6);
+            c.T2 = get(obj, "T2", 200e-6);
+            c.p1 = get(obj, "p1", 0.0);
+            c.p2 = get(obj, "p2", 0.0);
+            c.p_ro = get(obj, "p_ro", 0.0);
+            c.p_meas = get(obj, "p_meas", 0.0);
+            c.p_leak = pLeak > 0.0 ? pLeak : get(obj, "p_leak", 0.0);
+            c.p_leak_ro = get(obj, "p_leak_ro", 0.0);
+            c.p_prep = get(obj, "p_prep", 0.0);
         }
         return c;
     }
@@ -787,6 +820,67 @@ static Window cutWindow(double p, double B, const Calib &c, double f)
 }
 
 //===----------------------------------------------------------------------===//
+// Time-based fidelity model (real hardware data). Predict the carried qubit's
+// delivered fidelity after being held for D loop iterations.
+//===----------------------------------------------------------------------===//
+
+// count 1q/2q gates ON the carried wire per body execution
+static void countCarriedGates(Value carriedArg, int &n1q, int &n2q)
+{
+    n1q = n2q = 0;
+    Value cur = carriedArg;
+    llvm::DenseSet<Value> seen;
+    while (cur && seen.insert(cur).second) {
+        Operation *consumer = nullptr;
+        for (Operation *u : cur.getUsers())
+            if (isa<MeasureOp>(u) || isa<CustomOp>(u) || isa<InsertOp>(u)) {
+                consumer = u;
+                break;
+            }
+        if (!consumer || isa<InsertOp>(consumer) || isa<MeasureOp>(consumer))
+            break;
+        auto cu = cast<CustomOp>(consumer);
+        unsigned nq = cu.getInQubits().size() + cu.getInCtrlQubits().size();
+        (nq >= 2 ? n2q : n1q)++;
+        cur = customContinuation(cu, cur);
+    }
+}
+
+// F(D) = e^{-t_idle/T1} e^{-t_idle/T2} (1-e1q)^{D n1q} (1-e2q)^{D n2q}
+//        (1-leak)^{D n2q},  t_idle = D (B + tau)
+static double predictFidelity(double D, const Calib &c, double Bsec, int n1q,
+                              int n2q, double pLeak)
+{
+    double tidle = D * (Bsec + c.tau);
+    double F = 1.0;
+    if (!std::isinf(c.T1))
+        F *= std::exp(-tidle / c.T1);
+    if (!std::isinf(c.T2))
+        F *= std::exp(-tidle / c.T2);
+    F *= std::pow(1.0 - c.p1, D * n1q);
+    F *= std::pow(1.0 - c.p2, D * n2q);
+    F *= std::pow(1.0 - pLeak, D * n2q);
+    return F;
+}
+
+// mean delivered fidelity over the geometric trip distribution. Unbounded: the
+// carried qubit ages k iterations. Bounded/refresh at C: the delivered segment
+// age is ((k-1) mod C) + 1 (reset every C).
+static double meanFidelity(const Calib &c, double Bsec, int n1q, int n2q,
+                           double pLeak, double p, int C /* 0 = unbounded */)
+{
+    double s = 0.0, w;
+    for (int k = 1; k <= 200000; ++k) {
+        w = p * std::pow(1.0 - p, k - 1);
+        int age = C > 0 ? ((k - 1) % C) + 1 : k;
+        s += w * predictFidelity((double)age, c, Bsec, n1q, n2q, pLeak);
+        if (w < 1e-14 && k > 8)
+            break;
+    }
+    return s;
+}
+
+//===----------------------------------------------------------------------===//
 // Profitability cost model + strategy selection (Part 3.5). No DISCARD arm.
 //===----------------------------------------------------------------------===//
 enum class Strategy { None, Refresh, Knit };
@@ -1063,7 +1157,8 @@ struct LoopKnittingPass : impl::LoopKnittingPassBase<LoopKnittingPass> {
     {
         MLIRContext *ctx = &getContext();
         OpBuilder b(ctx);
-        Calib c = Calib::load(calib);
+        Calib c = Calib::load(calib, carryQubit, pLeak);
+        int n1qCarry = 0, n2qCarry = 0; // gates on the carried wire per body
 
         // nested dynamic loop guard (Part 3.2)
         bool nested = false;
@@ -1115,6 +1210,7 @@ struct LoopKnittingPass : impl::LoopKnittingPassBase<LoopKnittingPass> {
                 loop.getAfter().front().getArgument(info.carryArgIdx);
             fr = proveKnownState(carriedArg, loop.getAfter().front());
             prep = captureInputPrep(loop.getInits()[info.carryArgIdx]);
+            countCarriedGates(carriedArg, n1qCarry, n2qCarry);
             tier1 = (fr.kind != Known::Unprovable) && prep.ok;
             StringRef ks = fr.kind == Known::Identity     ? "identity"
                            : fr.kind == Known::KnownPauli ? "pauli"
@@ -1180,6 +1276,31 @@ struct LoopKnittingPass : impl::LoopKnittingPassBase<LoopKnittingPass> {
             loop->setAttr("knit.C", b.getI64IntegerAttr(C));
             loop->setAttr("knit.window",
                           b.getDenseI64ArrayAttr({wLo, wKnit.cMax}));
+        }
+
+        // Time-based fidelity prediction from real hardware data (calib in
+        // seconds). Predict the carried qubit's delivered fidelity for the
+        // UNBOUNDED depth (mean trip count E[k]=1/p) and the BOUNDED depth (the
+        // cut period C the pass would enforce).
+        if (!c.unit) {
+            // bounded uses the strategy's C if firing, else the tightest bound
+            // the best applicable mechanism could use.
+            int Cb = strat != Strategy::None ? C
+                     : tier1                 ? 1
+                                             : wKnit.cMin;
+            double Fu = meanFidelity(c, B, n1qCarry, n2qCarry, pLeak, pSuccess, 0);
+            double Fb =
+                meanFidelity(c, B, n1qCarry, n2qCarry, pLeak, pSuccess, Cb);
+            loop->setAttr("knit.predicted_fidelity",
+                          b.getDictionaryAttr({
+                              b.getNamedAttr("unbounded", b.getF64FloatAttr(Fu)),
+                              b.getNamedAttr("bounded", b.getF64FloatAttr(Fb)),
+                          }));
+            if (depth > 0)
+                loop->setAttr(
+                    "knit.fidelity_at_depth",
+                    b.getF64FloatAttr(predictFidelity((double)depth, c, B,
+                                                      n1qCarry, n2qCarry, pLeak)));
         }
 
         if (analyzeOnly)
