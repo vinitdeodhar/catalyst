@@ -636,6 +636,50 @@ the simulator are tied together by the **shared calibration JSON** and validated
 by the predicted↔measured agreement (§8.4 S3). (A future extension could compile
 and execute the refresh arm, whose output lowers without new runtime.)
 
+### 9.1 Frontend & lowering requirements
+
+**The benchmarks are already expressible in Catalyst** — the `@qjit` forms use
+`@while_loop` (dynamic, measurement-conditioned loop), `measure` (mid-circuit),
+`qml.cond` (feedforward), and a never-measured target wire that crosses the
+`scf.while` carry un-measured (the CARRY slot, §3.1). Ancillas are reset-and-reused
+via `qml.cond(m, PauliX)`, not per-iteration allocation (fixed device register).
+The only friction is compile time (a Toffoli gadget qjit'd in >500 s) — a
+performance, not an expressibility, gap.
+
+Requirements split by which side of the pass they touch:
+
+**Input side — feeding `--purl` (met today, no lowering change).** Catalyst already
+lowers `@qjit`+`while_loop`+`measure`+`cond` to quantum-dialect `scf.while` with
+register-threaded qubits, tensor-wrapped classical values, and
+`stablehlo`/`tensor.extract` glue — the shape §3.1–3.3 are written for. Capture it
+with `keep_intermediate`/`catalyst-cli`, then `quantum-opt --purl`. The one
+constraint is **pass ordering**: `--purl` must run while MCM is still
+`quantum.measure` + `scf.while` — *before* `dynamic-one-shot` rewrites measurements
+for sampling and *before* gate decomposition flattens the body — and *before*
+placement (Purl changes the circuit, §3.0 note).
+
+**Output side — compiling the transformed IR (the real work, largely out of scope
+per §9):**
+1. **`quantum.qcut` op + `--purl-lower-qcut`** — the new dialect op and lowering
+   pass (§3.7). Additive; the main dialect enhancement.
+2. **Reset** — refresh needs measure→|0>; no native `quantum.reset`, so expand as
+   measure + conditional-X (§3.7c). A native reset op would be cleaner (optional).
+3. **Catalyst-faithful carry surgery** — the counter (`i32`) and KNIT weight (`f64`)
+   added to the `scf.while` carry must follow the **tensor-wrapped classical
+   convention** (`tensor<...>` + `from_elements`/`extract`), or the transformed IR
+   fails to re-lower (bufferization → LLVM). Most likely breakage point.
+4. **Profile & placement metadata in the IR** — to retire the `p`/`shots`/`sigma0`/
+   `carry-qubit` options (§3.0): a `while_loop` success-rate attribute (`p`),
+   observable variance (`sigma0`), shots from the qjit config, and a wire→physical
+   placement attribute (`carry-qubit`).
+5. **Noisy execution backend** — to *measure* (not predict) fidelity of the lowered
+   output; `lightning` is noiseless. This is the gap §9 scopes out; the study
+   substitutes the trajectory simulator via the shared JSON.
+6. **KNIT runtime surface** — the KNIT arm also needs the `@purl_sample_term` RNG
+   hook and `expval`→weighted-sample legalization (`sample`/`counts` + runtime RNG).
+   The **refresh** arm needs none of this (`expval` survives), which is why refresh
+   is the clean end-to-end path.
+
 ---
 
 ## 10. Repository layout (deliverables)
