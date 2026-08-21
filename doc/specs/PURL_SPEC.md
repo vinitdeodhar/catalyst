@@ -54,7 +54,7 @@ a compiled backend (compiled execution is explicitly out of scope — see §9).
 - All three benchmarks lower to MLIR and the pass applies to the lowered MLIR (§6).
 - The eval script runs the full pipeline for every benchmark and prints the
   table with a legend (§8), and pass-*predicted* fidelity agrees with
-  simulator-*measured* fidelity to within a few percent (§8.4).
+  simulator-*measured* fidelity to within **|ΔF| ≤ 0.02 at `lam=1`** (§8.4 S3).
 
 ### 1.1 Definitions
 
@@ -69,8 +69,14 @@ The loop is **dynamic** iff the boolean `%c` has a backward data-dependence on t
 (i) classical glue — `tensor.extract` / `tensor.from_elements`, `stablehlo.*`,
 `arith.*` — and (ii) the loop carry — a `before`-region block argument at index
 *i* resolves to the *i*-th operand of the body's `scf.yield` (one hop across the
-iteration boundary). Equivalently: **trip count k is determined by runtime
-measurement results and has unbounded support** (`P(k > N) > 0` for all N).
+iteration boundary). Measurement-dependence of `%c` is **necessary but not
+sufficient** for unbounded support: a predicate like `%m AND (counter < N)` is
+measurement-conditioned yet statically capped at `N`. Purl therefore additionally
+requires that **no compile-time bound dominates** the condition — if a static
+counter guard conjoined into `%c` caps the trip count, the loop is treated as
+bounded (detected and **warned**, not cut). Absent such a dominating bound, trip
+count `k` has unbounded support (`P(k > N) > 0` for all N). (Purl's own bounded
+output is protected separately by `purl.applied`.)
 
 Two orthogonal points: *dynamic* is a property of the loop **condition**
 (measurement-conditioned ⇒ unbounded k); it says nothing yet about the qubits.
@@ -170,7 +176,7 @@ loop/observable attributes, and the `@qjit` shot config (see §9).
 | `f` | compiler | 3.3 | Coherence-budget fraction for the window ceiling `C_max = floor(f·T2/(B+tau))`. |
 | `C` | compiler | 3.5 | Override the cut period instead of letting the cost model pick the arg-min over the window. |
 | `margin` | compiler | 3.5 | Profitability guard: cut fires iff `predicted·margin < predicted(NONE)`. |
-| `depth` | compiler | 3.6 | Report `purl.fidelity_at_depth` at this runtime depth `D` (`0` disables). |
+| `depth` | compiler | 3.6 | Report `purl.fidelity_at_depth` at this runtime depth `D`, **in iterations** (`0` disables). |
 | `analyze-only` | compiler | all | Emit `purl.*` attributes without rewriting the IR (inspection/audit mode). |
 | `p` | profile | 3.3, 3.5 | RUS success probability per iteration → the trip distribution (`E[k]=1/p`, `C_min`, age `sbar(C)`, `E[#cuts]`). Not in the IR (the loop is unbounded-dynamic, §1.1). Sets the *expected payoff* of cutting, hence the NONE-vs-cut decision. |
 | `shots` | profile | 3.5 | `S`, the shot budget → the statistical term `sigma0/sqrt(S)` and the KNIT variance `sigma0·sqrt(V(C)/S)`. |
@@ -185,7 +191,8 @@ Note (`carry-qubit` and pass ordering): `--purl` runs **before** qubit placement
 routing, so the logical→physical binding does not yet exist in the IR — hence it
 is supplied as an *option*, a representative/target-qubit hint for the §3.6
 prediction. This is deliberate: Purl *changes the circuit* (inserts measure+reset+
-re-prep, and KNIT adds ancillas), so it must run before placement and let a single
+re-prep on the carried wire — no new ancillas; both refresh and KNIT reuse the
+carried wire), so it must run before placement and let a single
 downstream mapping pass route the final circuit. Were Purl placed *after* routing
 it could read the real physical qubit from a wire attribute (exact prediction), but
 its inserted ops would then need re-routing. The chosen order trades an exact qubit
@@ -222,10 +229,14 @@ gates and readouts (per body) for the cost model. Nested `scf.while` → error.
 Emit `purl.body_seconds` (or `purl.body_layers`).
 
 ### 3.3 Cut-period window
-`C_min = ceil(ln(gamma^2)/ln(1/(1-p)))` (variance floor, gamma=4);
-`C_max = floor(f*T2/(B+tau))` (coherence budget). Emit `purl.window=[C_min,C_max]`.
-The deterministic (refresh) strategy has **no** variance floor, so its window is
-`[1, C_max]`.
+`C_min` = the smallest `C` with **`V(C) ≤ V_max`** (variance cap, default
+`V_max = 4`), where `V(C) = (1-q)/(1-γ²q)`, `q = (1-p)^C`, `γ² = 16` (§3.5). This
+bounds the KNIT sampling overhead, not merely its finiteness: bare finiteness
+`γ²q < 1` is the `V_max → ∞` limit and recovers the closed form
+`ceil(ln(γ²)/ln(1/(1-p)))`.
+`C_max = floor(f·T2/(B+tau))` (coherence budget; `f` default **0.05**). Emit
+`purl.window=[C_min,C_max]`. The deterministic (refresh) strategy has **no**
+variance floor, so its window is `[1, C_max]`.
 
 ### 3.4 Known-state proof (enables the cheap cut)
 Stabilizer / Pauli-frame tracking of the carried wire over the loop body: carry
@@ -239,12 +250,20 @@ with outcome-independent sign → the carried state is a **known** pure state
 the carried failure path or Toffoli/multi-control → `unknown` (safe fallback).
 
 ### 3.5 Strategy selection (profitability cost model) + rewrite
-Per-iteration error is split into **transportable** `eps_t` (depolarizing +
-T1/T2 idle over B+tau) and **non-transportable** `eps_nt` (leakage per 2q gate /
-readout; `p-leak` is a separate knob). `eps_cut = p_ro + p_prep`. With
-`q=(1-p)^C`, `E[k]=1/p`, `E[#cuts]=q/(1-q)`, `V(C)=(1-q)/(1-16q)`, and `sbar(C)`
-= expected delivered-state age, the predicted expval error (RMSE of a bias + a
-statistical term) for each strategy:
+Per-iteration error is derived from the **same** fidelity model as §3.6 — one model,
+so the §3.5 arg-min and the §3.6 fidelity ranking cannot disagree. From §3.6's
+single-iteration retention factors `F1_t` (transportable) and `F1_nt` (leakage):
+
+- `eps_t  = 1 − F1_t`  — **transportable** (depolarizing + T2 idle over `B+tau`);
+- `eps_nt = 1 − F1_nt` — **non-transportable** (leakage per 2q gate; `p-leak` knob);
+- `eps_all = 1 − F1_t·F1_nt ≈ eps_t + eps_nt`;
+- `eps_cut = p_ro + p_prep`.
+
+With `q=(1-p)^C`, `E[k]=1/p`, `E[#cuts]=q/(1-q)`, `V(C)=(1-q)/(1-γ²q)` (`γ²=16`),
+and the expected delivered-state age
+`sbar(C) = Σ_{j≥1} p(1-p)^{j-1}·(((j-1) mod C) + 1)` (summed to convergence), the
+predicted expval error combines its bias and statistical terms **in quadrature**,
+`predicted = sqrt(bias² + statistical²)`, per strategy:
 
 | strategy | bias | statistical |
 |---|---|---|
@@ -253,10 +272,17 @@ statistical term) for each strategy:
 | KNIT@C (tier-3, gamma=4) | eps_t·E[k] + eps_nt·sbar(C) + E[#cuts]·eps_cut | sigma0·sqrt(V(C)/S) |
 
 Minimize each *applicable* strategy over its C-range (REFRESH `[1,C_max]`; KNIT
-`[C_min,C_max]`, `16q<1`); pick the arg-min; fire it iff
+`[C_min,C_max]`, `γ²q<1`); pick the arg-min; fire it iff
 `predicted·margin < predicted(NONE)`, else leave the loop unchanged. Emit
 `purl.strategy` ∈ {none, refresh, knit}, `purl.C`, and the auditable
-`purl.predicted = {none, refresh, knit}`. (No discard arm.)
+`purl.predicted = {none, refresh, knit}`.
+
+**No discard arm** — neither in the pass nor as an eval baseline. Under the §11
+Markovian analysis truncate+discard is a strong *fidelity* baseline, but it changes
+the delivered **computation** (conditioning the estimator on early success biases
+the observable), so it is deliberately excluded rather than compared. Refresh
+delivers the *same* computation at higher fidelity — that equivalence is the claim
+under test, and a discard arm would not be answering the same question.
 
 Both rewrites *insert a `quantum.qcut` op* (3.7) rather than expanding a cut
 inline — `--purl` builds the carry surgery + guard and bakes the strategy into the
@@ -277,16 +303,35 @@ the Markovian no-go (it replaces the noisy state with the ideal one).
 (3.7) performs the `func.call @purl_sample_term` RNG hook → basis change → measure
 → reset → eigenstate prep → `4·sigma·s` weight fold.
 
+Both REFRESH and KNIT use the **single counter idiom**: the `i32` counter increments
+each failing iteration and **resets to 0 at every fired cut** (period `C`). KNIT's
+`f64` weight, by contrast, **accumulates across cuts** (it is never reset).
+
 ### 3.6 Real-hardware fidelity prediction
 `calib` may be a **per-qubit + coupling-map** hardware dataset (§4). The carried
 wire's physical qubit (`carry-qubit`) supplies T1/T2/1q-err/readout; the median
 2q error comes from the coupling map. Predict the carried qubit's delivered
-fidelity with a **time-based model**:
+fidelity at runtime iteration count `D` with a **time-based model**, factored into
+a **transportable** and a **leakage** part so §3.5 reuses the same numbers:
 
 ```
-F(D) = exp(-t/T1)·exp(-t/T2)·(1-e1q)^(D·n1q)·(1-e2q)^(D·n2q)·(1-leak)^(D·n2q),
-t_idle = D·(B+tau)
+F1_t  = exp(-(B+tau)/T2) · (1-e1q)^n1q · (1-e2q)^n2q     // transportable, 1 iteration
+F1_nt = (1-p_leak)^n2q                                   // leakage, 1 iteration
+F(D)  = (F1_t)^D · (F1_nt)^D
 ```
+
+Symbols: `n1q,n2q` = per-iteration 1q/2q gate counts (§3.2); `e1q = gate_1q_err`,
+`e2q` = median incident `gate_2q_err`, `p_leak` from the `p-leak` knob (§4.1); the
+per-iteration idle time is `B+tau`, so `t_idle = D·(B+tau)`. Coherence decay uses
+**`exp(-t/T2)` only** — `1/T2` already contains the amplitude-damping term
+`1/(2·T1)` (exactly why §4.2 enforces `T2 ≤ 2·T1`), so a separate `exp(-t/T1)`
+factor would double-count it. The single-iteration factors `F1_t,F1_nt` are the
+source of §3.5's `eps_t = 1−F1_t`, `eps_nt = 1−F1_nt` — the decision and the
+prediction are one model.
+
+The prediction is at the **nominal `lam=1`** operating point (the simulator's global
+noise scale, §5); the pass has no `lam` knob, so `purl.predicted_fidelity` is
+comparable to the simulator only at `lam=1` — which is where S3 (§8.4) compares.
 
 Emit `purl.predicted_fidelity = {unbounded, bounded}` — the **mean** delivered
 fidelity over the geometric trip distribution (unbounded age = k; bounded/refresh
@@ -307,7 +352,7 @@ quantum-dialect op that names the cut abstractly:
 
 // REFRESH: no weight; prep region reproduces the loop's input |psi0>
 %q' = quantum.qcut %q
-        { strategy = "refresh", pauli_correction = #purl<pauli none> }
+        { strategy = "refresh", pauli_correction = #quantum<pauli none> }
         prep { ^bb0(%fresh: !quantum.bit): /* input prep */ 
                quantum.yield %prepared : !quantum.bit }
       : (!quantum.bit) -> !quantum.bit
@@ -316,7 +361,9 @@ quantum-dialect op that names the cut abstractly:
 The op is deliberately **self-contained** — because the lowering does no analysis,
 `--purl` bakes every decision into it: the chosen `strategy`, the observable
 `axis`, the KnownPauli `pauli_correction`, and the known-state preparation as a
-captured `prep` region (the loop's input prep of `|psi0>` from a fresh `|0>`). The
+captured `prep` region (the loop's input prep of `|psi0>` from a fresh `|0>`). All
+qcut attributes live in the **`quantum` dialect namespace** (`#quantum<…>`) — there
+is no separate `purl` attribute dialect. The
 counter/weight carry surgery and the `if counter == C { qcut }` guard are also
 built by `--purl` (which alone knows `strategy` and `C`); the op sits inside that
 guard. Verifier: `refresh` takes/returns one qubit and no weight; `knit` takes/
@@ -464,6 +511,12 @@ only as the separate `p-leak` knob (published estimate ~1e-3 per 2q gate) suppli
 to *both* the pass and the simulator; a loader that finds a `leakage`/`p_leak` key
 in the file **errors** (to force the single-source convention).
 
+**Leakage is charged per 2q gate** — one mechanism, stated once here and referenced
+everywhere: the pass (§3.6, `F1_nt = (1-p_leak)^n2q`), the simulator (§5), and the
+§3.0 glossary all apply `p_leak` **per 2q gate**, not per idle-second. A per-second
+charge on one side and per-gate on the other would break S3 (predicted↔measured) by
+construction, so the per-2q-gate convention is normative.
+
 ### 4.2 Validation (loader-enforced)
 
 The loader rejects a file (hard error) unless:
@@ -536,13 +589,17 @@ stochastic channel sampling), independent of Catalyst at runtime.
 - **Noise (parameterised by the §4 JSON + `p-leak` + a global scale `lam`∈[0,4]):**
   per-1q/2q depolarizing; readout flip + pre-measure depolarizing; **idle
   amplitude-damping + pure-dephasing** over the per-iteration idle time (from
-  T1/T2); and **leakage** (population leaving the computational subspace during
-  idle; a fresh qubit / cut clears it — the reset-clearable error the transform
-  reduces). `lam=0` is exactly noiseless.
+  T1/T2); and **leakage** (population leaving the computational subspace, charged
+  **per 2q gate** at rate `lam·p_leak` — the same mechanism as §3.6/§4.1, *not* a
+  per-idle-second charge; a reset / cut clears it — the reset-clearable error the
+  transform reduces). `lam=0` is exactly noiseless.
 - **Executors** mirroring the pass's arms: `unbounded`, `refresh` (measure +
   force_zero + re-prep known |psi0>), `knit` (inline quasi-probability cut with
   weights). Delivered-state fidelity is measured by **3-basis tomography**
-  (estimate ⟨X⟩,⟨Y⟩,⟨Z⟩ over S/3 shots each; F = ½(1 + a·n_ideal)).
+  (estimate ⟨X⟩,⟨Y⟩,⟨Z⟩ over S/3 shots each; F = ½(1 + a·n_ideal)). For the **knit**
+  arm `a` is a *reconstructed*, weight-summed estimate that can be non-physical
+  (`|a| > 1`) at finite shots, so `|a|` is **clamped to ≤ 1** before computing F,
+  and this arm's column is labelled **"reconstructed"** in the §8.2 legend.
 - **Validation gates:** at `lam=0` the primary benchmark reproduces its noiseless
   ⟨Z⟩; an idle |+⟩ over T2 shows ⟨X⟩ ≈ e^-1.
 
@@ -557,14 +614,24 @@ applied to; and (b) a **Python mirror** driving the §5 simulator, kept in locks
 for the fidelity study. All three are carry-type, hold the non-Clifford magic
 state `|psi0> = H T H T H |0>`, and return `qml.expval(PauliZ(target))`.
 
-| Name | p | Role |
-|---|---|---|
-| `rus_rx_ibm` | 5/8 | primary; IBM-tutorial RUS shape (2 controls + 1 held target) |
-| `rus_chain(N)` | 5/8 / stage | N sequential RUS gates on one held data qubit (N ∈ {1,2,4,8}) |
-| `rus_lowp` | 0.1 | low-p heavy-tail regime (quantum-repeater / heralded memory); mean trip count 10 — where cutting is meant to help |
+| Name | p | coin gate set | Role |
+|---|---|---|---|
+| `rus_rx_ibm` | 5/8 | Toffoli-sandwich (multi-control, **non-Clifford**) | primary; IBM-tutorial RUS shape (2 controls + 1 held target) |
+| `rus_chain(N)` | 5/8 / stage | Toffoli per stage | N sequential RUS gates on one held data qubit (N ∈ {1,2,4,8}) |
+| `rus_lowp` | 0.1 | **CNOT-heralded** (Clifford + CNOT ancilla; identity on the target on failure) | low-p heavy-tail regime (quantum-repeater / heralded memory); mean trip count 10 — where cutting is meant to help |
 
-NOTE: the carried qubit's physics is identical across the three; they differ in
-the trip-count distribution (p) and stage count (N).
+The three hold the same input state and identical carried-qubit *physics*; they
+differ in the trip distribution (`p`), stage count (`N`), and — deliberately — the
+**coin gate set**, which decides provability (§3.4). `rus_lowp` uses a CNOT-based
+heralding coin whose net action on the held target is provably **identity** on
+failure, so REFRESH fires; the Toffoli-based coins are non-Clifford multi-control,
+which §3.4 cannot prove, so they fall back to KNIT/NONE. Expected pass outcomes:
+
+| benchmark | purl.class | purl.known_state | expected purl.strategy |
+|---|---|---|---|
+| `rus_rx_ibm` | carry | unknown | **none** (thin p=5/8 tail, §11; knit only if its window is non-empty and profitable) |
+| `rus_chain(N)` | carry | unknown | none / knit per stage |
+| `rus_lowp` | carry | identity | **refresh** — the headline positive result (§11, S2) |
 
 ---
 
@@ -594,9 +661,15 @@ table.
 1. Build the `@qjit` program; lower to MLIR (`keep_intermediate` / `catalyst-cli`).
 2. Apply the Purl pass to that MLIR (`quantum-opt --purl calib=ibm_eagle_r3.json
    p=<p> shots=<S> p-leak=<leak> carry-qubit=<q>`); parse `purl.strategy`,
-   `purl.C`, `purl.predicted_fidelity`.
+   `purl.C`, `purl.window`, `purl.predicted_fidelity`.
 3. For each noise scale `lam`, measure delivered fidelity with the §5 simulator
-   (same JSON) for the arms **unbounded**, **refresh (g1)**, **knit (g4)**.
+   (same JSON) for the arms **unbounded**, **refresh (g1)**, **knit (g4)**. If an
+   arm's C-window is empty (e.g. KNIT on `rus_lowp`, where `C_min ≈ 27 > C_max`),
+   **skip it and mark `n/a`** with a "divergent-variance" flag — never force a `C`
+   outside the window.
+4. **C-sweep (refresh arm, one benchmark — `rus_lowp`):** at `lam=1`, sweep `C`
+   across `purl.window` and record the simulator's best-fidelity `C*`. This is the
+   empirical best-C that S4 checks the pass window brackets.
 
 ### 8.2 Output table (with legend)
 Columns: `benchmark[config]`, `lam`, runtime coherent depth of the unbounded arm
@@ -608,7 +681,8 @@ CSV.
 
 ### 8.3 Config
 Default `--ibm` (the §4 dataset), `--carry-qubit`, `--leak` (published estimate),
-`-S`, `--seeds`, and `lam ∈ {0, 0.25, 0.5, 1, 2, 4}`.
+`-S` (shots), `--seeds` (default **8**, for the seed-std error bars), `--f`
+(coherence-budget fraction, default **0.05**), and `lam ∈ {0, 0.25, 0.5, 1, 2, 4}`.
 
 ### 8.4 Success criteria (paper claims)
 - **S1 — pipeline:** every benchmark lowers to MLIR and the pass applies to it,
@@ -617,11 +691,14 @@ Default `--ibm` (the §4 dataset), `--carry-qubit`, `--leak` (published estimate
   simulator-measured `refresh` fidelity > `unbounded` for `lam ≥ 0.5`, by a
   margin that grows with `lam` (non-overlapping error bars).
 - **S3 — predicted ≈ measured:** pass-`purl.predicted_fidelity` agrees with the
-  simulator-measured fidelity of the selected strategy to within a few percent.
-- **S4 — window/strategy honesty:** the pass's window brackets the simulator's
-  best C; the cost model selects `refresh` where the state is provably known and
-  `none`/`knit` otherwise. The regime where cutting does NOT help is itself a
-  reported result (e.g. p=5/8 thin tail).
+  simulator-measured fidelity of the selected strategy to within **|ΔF| ≤ 0.02
+  absolute, evaluated at `lam=1`** (the only operating point where the two are
+  comparable — the pass predicts at nominal noise, §3.6).
+- **S4 — window/strategy honesty:** the pass's window `[C_min,C_max]` **brackets
+  the empirical best `C*`** from the refresh C-sweep (§8.1 step 4); the cost model
+  selects `refresh` where the state is provably known and `none`/`knit` otherwise.
+  The regime where cutting does NOT help is itself a reported result (e.g. p=5/8
+  thin tail).
 - **S5 — tests:** all §7 FileCheck tests green.
 
 ---
@@ -668,6 +745,11 @@ per §9):**
    added to the `scf.while` carry must follow the **tensor-wrapped classical
    convention** (`tensor<...>` + `from_elements`/`extract`), or the transformed IR
    fails to re-lower (bufferization → LLVM). Most likely breakage point.
+   **PoC status:** the current rewrite deliberately emits **bare `i32`/`f64`**
+   carries into the real IR — valid MLIR that the pass and `--analyze-only` consume
+   and that the §5 study never re-lowers, so the `from_elements`/`extract` plumbing
+   is *deferred work, not a silent bug*. An implementer targeting execution must add
+   it here.
 4. **Profile & placement metadata in the IR** — to retire the `p`/`shots`/`sigma0`/
    `carry-qubit` options (§3.0): a `while_loop` success-rate attribute (`p`),
    observable variance (`sigma0`), shots from the qjit config, and a wire→physical
@@ -711,10 +793,11 @@ purl/
 - The **refresh** cut (proven known state) *does* escape the no-go: it replaces
   the noisy state with the ideal one, removing all accumulated error at gamma=1,
   zero variance, and no coherence-budget-limited variance floor.
-- For high p (RUS, 5/8) the corrupted tail is ~5% of shots and `C_min ≈ 2.77/p`
-  tracks the mean trip count — so cutting only ever touches the ~6% tail
-  regardless of p; the benefit is real but small unless the tail is heavy
-  (`rus_lowp`) and the cut is cheap (refresh).
+- For high p (RUS, 5/8) the corrupted tail is ~5% of shots and the KNIT floor
+  `C_min ≈ 3/p` (variance cap `V_max=4`, §3.3; refresh has no floor) tracks the mean
+  trip count — so cutting only ever touches the ~6% tail regardless of p; the
+  benefit is real but small unless the tail is heavy (`rus_lowp`) and the cut is
+  cheap (refresh).
 - On **real IBM Eagle r3** coherence, `rus_lowp` (mean hold ~10 iters) decoheres
   substantially and refresh recovers several percent of delivered fidelity —
   the headline positive result.
