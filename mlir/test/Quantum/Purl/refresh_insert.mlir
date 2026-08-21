@@ -11,11 +11,13 @@
 // carry is (i1, !quantum.bit, i32) -- counter only, no f64 weight
 // CHECK: scf.while ({{.*}}) : (i1, !quantum.bit, i32) -> (i1, !quantum.bit, i32)
 // CHECK: scf.if
-// the abstract cut op, with its |psi0> prep region and refresh strategy
+// the abstract cut op, refresh strategy, with its |psi0> prep region (H T H T H)
 // CHECK: purl.qcut
+// CHECK-SAME: strategy = #purl<strategy refresh>
 // CHECK: quantum.custom "Hadamard"
 // CHECK: quantum.custom "T"
-// CHECK: refresh
+// CHECK: purl.yield
+// while-op attributes print alphabetically: known_state before strategy
 // CHECK: purl.known_state = "identity"
 // CHECK: purl.strategy = "refresh"
 // CHECK: return {{.*}} : f64

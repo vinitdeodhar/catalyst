@@ -51,6 +51,7 @@ using llvm::Twine;
 namespace catalyst {
 namespace purl {
 
+#define GEN_PASS_DECL_PURLPASS
 #define GEN_PASS_DEF_PURLPASS
 #include "Purl/Transforms/Passes.h.inc"
 
@@ -883,10 +884,10 @@ static double meanFidelity(const Calib &c, double Bsec, int n1q, int n2q,
 //===----------------------------------------------------------------------===//
 // Profitability cost model + strategy selection (Part 3.5). No DISCARD arm.
 //===----------------------------------------------------------------------===//
-enum class Strategy { None, Refresh, Knit };
+enum class CutStrategy { None, Refresh, Knit };
 
 struct Predicted {
-    Strategy strat = Strategy::None;
+    CutStrategy strat = CutStrategy::None;
     int C = 0;
     double none = 0, refresh = 0, knit = 0; // predicted expval errors
 };
@@ -986,16 +987,16 @@ static Predicted selectStrategy(double p, const EpsRates &e, const Window &win,
     double bestErr = INFINITY;
     if (bestRef < bestErr) {
         bestErr = bestRef;
-        r.strat = Strategy::Refresh;
+        r.strat = CutStrategy::Refresh;
         r.C = bestRefC;
     }
     if (bestKnit < bestErr) {
         bestErr = bestKnit;
-        r.strat = Strategy::Knit;
+        r.strat = CutStrategy::Knit;
         r.C = bestKnitC;
     }
     if (!(bestErr * margin < r.none)) {
-        r.strat = Strategy::None;
+        r.strat = CutStrategy::None;
         r.C = 0;
     }
     return r;
@@ -1155,7 +1156,7 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         Window wKnit = cutWindow(pSuccess, B, c, budgetFraction);
 
         // Strategy + cut-period selection.
-        Strategy strat;
+        CutStrategy strat;
         int C = 0;
         if (shots > 0) {
             // Part 3.5: profitability model chooses NONE / REFRESH / KNIT and C.
@@ -1178,8 +1179,8 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         else {
             // Legacy (no shot budget): fire the best available mechanism, no
             // profitability veto. REFRESH if tier-1, else KNIT.
-            strat = tier1 ? Strategy::Refresh : Strategy::Knit;
-            int cMin = strat == Strategy::Refresh ? 1 : wKnit.cMin;
+            strat = tier1 ? CutStrategy::Refresh : CutStrategy::Knit;
+            int cMin = strat == CutStrategy::Refresh ? 1 : wKnit.cMin;
             int cMax = wKnit.cMax;
             if (cMin > cMax) {
                 loop.emitError("empty cut-period window: C_min=" + Twine(cMin) +
@@ -1187,7 +1188,7 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
                 signalPassFailure();
                 return;
             }
-            int Cdef = strat == Strategy::Refresh ? std::min(3, cMax) : cMin;
+            int Cdef = strat == CutStrategy::Refresh ? std::min(3, cMax) : cMin;
             C = cutPeriod > 0 ? cutPeriod : Cdef;
             if (C < cMin || C > cMax) {
                 loop.emitError("requested C=" + Twine(C) + " outside window [" +
@@ -1197,16 +1198,16 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
             }
         }
 
-        StringRef stratStr = strat == Strategy::None      ? "none"
-                             : strat == Strategy::Refresh ? "refresh"
+        StringRef stratStr = strat == CutStrategy::None      ? "none"
+                             : strat == CutStrategy::Refresh ? "refresh"
                                                           : "knit";
         loop->setAttr("purl.strategy", b.getStringAttr(stratStr));
         loop->setAttr("purl.cut",
-                      b.getStringAttr(strat == Strategy::Refresh ? "deterministic"
-                                      : strat == Strategy::Knit  ? "quasiprobability"
+                      b.getStringAttr(strat == CutStrategy::Refresh ? "deterministic"
+                                      : strat == CutStrategy::Knit  ? "quasiprobability"
                                                                  : "none"));
-        int wLo = strat == Strategy::Refresh ? 1 : wKnit.cMin;
-        if (strat != Strategy::None) {
+        int wLo = strat == CutStrategy::Refresh ? 1 : wKnit.cMin;
+        if (strat != CutStrategy::None) {
             loop->setAttr("purl.C", b.getI64IntegerAttr(C));
             loop->setAttr("purl.window",
                           b.getDenseI64ArrayAttr({wLo, wKnit.cMax}));
@@ -1219,7 +1220,7 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         if (!c.unit) {
             // bounded uses the strategy's C if firing, else the tightest bound
             // the best applicable mechanism could use.
-            int Cb = strat != Strategy::None ? C
+            int Cb = strat != CutStrategy::None ? C
                      : tier1                 ? 1
                                              : wKnit.cMin;
             double Fu = meanFidelity(c, B, n1qCarry, n2qCarry, pLeak, pSuccess, 0);
@@ -1244,7 +1245,7 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         if (loop->hasAttr("purl.applied"))
             return;
 
-        if (strat == Strategy::None) {
+        if (strat == CutStrategy::None) {
             loop.emitRemark("purl: not profitable; loop left unchanged");
             return;
         }
@@ -1253,7 +1254,7 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
             return;
         }
         Window wSel{wLo, wKnit.cMax};
-        bool ok = strat == Strategy::Refresh
+        bool ok = strat == CutStrategy::Refresh
                       ? doRewriteDeterministic(loop, info.carryArgIdx, C, wSel, fr, prep)
                       : doRewrite(loop, info.carryArgIdx, C, wSel);
         if (!ok)
@@ -1295,9 +1296,9 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
             resTys.push_back(b.getF64Type());
         }
         st.addTypes(resTys);
-        st.addAttribute("strategy", PurlStrategyAttr::get(ctx, strat));
-        st.addAttribute("axis", PurlPauliAttr::get(ctx, axis));
-        st.addAttribute("pauli_correction", PurlPauliAttr::get(ctx, corr));
+        st.addAttribute("strategy", StrategyAttr::get(ctx, strat));
+        st.addAttribute("axis", PauliAttr::get(ctx, axis));
+        st.addAttribute("pauli_correction", PauliAttr::get(ctx, corr));
         // populate the prep region BEFORE creating the op (standard pattern)
         Region *reg = st.addRegion();
         Block *blk = new Block();
@@ -1317,12 +1318,13 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
     {
         OpBuilder b(loop);
         Location loc = loop.getLoc();
-        Type i32 = b.getI32Type(), f64 = b.getF64Type();
+        Type i32 = b.getI32Type(), f64 = b.getF64Type(), i1 = b.getI1Type();
 
         // applicability precheck: expval of a namedobs on the carried result
         ObsChain oc = findObsChain(loop, carryIdx);
         if (!oc.ok)
             return false;
+        Type qT = oc.obs.getQubit().getType();
         int failIdx = failIndex(loop);
         unsigned nCarry = loop.getNumResults();
 
