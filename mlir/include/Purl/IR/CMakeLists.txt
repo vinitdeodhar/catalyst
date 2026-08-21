@@ -1,0 +1,10 @@
+add_mlir_dialect(PurlOps purl)
+add_mlir_doc(PurlDialect PurlDialect Purl/ -gen-dialect-doc)
+add_mlir_doc(PurlOps PurlOps Purl/ -gen-op-doc)
+
+set(LLVM_TARGET_DEFINITIONS PurlOps.td)
+mlir_tablegen(PurlEnums.h.inc -gen-enum-decls)
+mlir_tablegen(PurlEnums.cpp.inc -gen-enum-defs)
+mlir_tablegen(PurlAttributes.h.inc -gen-attrdef-decls -attrdefs-dialect=purl)
+mlir_tablegen(PurlAttributes.cpp.inc -gen-attrdef-defs -attrdefs-dialect=purl)
+add_public_tablegen_target(MLIRPurlEnumsIncGen)

@@ -23,6 +23,7 @@
 #include "MBQC/IR/MBQCDialect.h"
 #include "Mitigation/IR/MitigationDialect.h"
 #include "PBC/IR/PBCDialect.h"
+#include "Purl/IR/PurlDialect.h"
 #include "PauliFrame/IR/PauliFrameDialect.h"
 #include "QRef/IR/QRefDialect.h"
 #include "QecLogical/IR/QecLogicalDialect.h"
@@ -38,6 +39,7 @@ int main(int argc, char **argv)
     registry.insert<catalyst::quantum::QuantumDialect>();
     registry.insert<catalyst::qref::QRefDialect>();
     registry.insert<catalyst::pbc::PBCDialect>();
+    registry.insert<catalyst::purl::PurlDialect>();
     registry.insert<catalyst::gradient::GradientDialect>();
     registry.insert<catalyst::mbqc::MBQCDialect>();
     registry.insert<catalyst::mitigation::MitigationDialect>();
