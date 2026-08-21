@@ -1,0 +1,7 @@
+benchmark,lam,p,C_knit,C_refresh,B_layers,depth_per_iter,min_number_of_iterations,mean_number_of_iterations,max_number_of_iterations,runtime_depth,fidelity_unbounded,fidelity_knit,fidelity_refresh,std_knit,std_refresh,knit_admissible
+rus_rx_ibm,0.0,0.625,,2,12,12,1,1.604,10,19.2,0.9935,,0.9893,,0.0196,0
+rus_rx_ibm,0.25,0.625,,2,12,12,1,1.589,11,19.1,0.9928,,0.977,,0.0079,0
+rus_rx_ibm,0.5,0.625,,2,12,12,1,1.588,11,19.1,0.9903,,0.9718,,0.0079,0
+rus_rx_ibm,1.0,0.625,,2,12,12,1,1.593,10,19.1,0.9707,,0.9545,,0.0127,0
+rus_rx_ibm,2.0,0.625,,2,12,12,1,1.593,10,19.1,0.9482,,0.9416,,0.0241,0
+rus_rx_ibm,4.0,0.625,,2,12,12,1,1.585,10,19.0,0.9127,,0.8985,,0.0207,0
