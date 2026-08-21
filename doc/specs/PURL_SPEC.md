@@ -160,13 +160,14 @@ register-threaded qubits). The rewrite (3.5) fires on carry loops with an
 ### 3.0 `--purl` options (glossary)
 
 All options live on `--purl`; `--purl-lower-qcut` takes none (every decision they
-influence is already baked into the `quantum.qcut` op). Four provenance classes:
+influence is baked into the `quantum.qcut` op). Four provenance classes:
 **hardware** (device properties, from the calibration dataset), **placement** (the
 logical→physical wire binding, from mapping/routing — a *selector* into the
 hardware data, not a property), **compiler knobs** (genuine tuning), and **profile
-inputs** (properties of the *program/observable/run*). Placement and profile
-options are a PoC shortcut; their target home is a wire placement attribute,
-loop/observable attributes, and the `@qjit` shot config (see §9).
+inputs** (properties of the *program/observable/run*). Placement and profile inputs
+are supplied as options when the pass is driven standalone; in a full pipeline their
+source is a wire placement attribute, loop/observable attributes, and the `@qjit`
+shot config (see §9).
 
 | option | class | feeds | meaning |
 |---|---|---|---|
@@ -188,7 +189,7 @@ averaged over the trip distribution, not the cut period itself. A worst-case
 per-trajectory objective would need only `C_max` and could drop `p`.
 
 Note (`carry-qubit` and pass ordering): `--purl` runs **before** qubit placement/
-routing, so the logical→physical binding does not yet exist in the IR — hence it
+routing, so the logical→physical binding is not present in the IR — hence it
 is supplied as an *option*, a representative/target-qubit hint for the §3.6
 prediction. This is deliberate: Purl *changes the circuit* (inserts measure+reset+
 re-prep on the carried wire — no new ancillas; both refresh and KNIT reuse the
@@ -603,6 +604,44 @@ stochastic channel sampling), independent of Catalyst at runtime.
 - **Validation gates:** at `lam=0` the primary benchmark reproduces its noiseless
   ⟨Z⟩; an idle |+⟩ over T2 shows ⟨X⟩ ≈ e^-1.
 
+### 5.1 Calibration wiring and noise model
+
+The simulator is structured as a three-stage pipeline from the §4 dataset to the
+trajectory core:
+
+- **Generator** (`ibm_dataset.build_json`) — writes `ibm_eagle_r3.json` in the §4
+  schema (per-qubit `T1/T2/gate_1q_err/readout_err`, per-edge `gate_2q_err`,
+  top-level times/`tau`/`p_prep`).
+- **Loader** (`ibm_dataset.carried_calib(qubit)`) — flattens the per-qubit +
+  coupling JSON for the carried qubit onto the trajectory core's calib keys:
+  `gate_1q_err→p1`, `median gate_2q_err→p2`, `readout_err→p_ro`,
+  `gate_1q_err→p_meas`, `T1/T2`, durations, `tau`, `p_prep`, and the separate
+  `p_leak` knob.
+- **Trajectory core** (`qsim.QSim(n, calib, lam)`) — draws those rates into the
+  noise model: T1/T2 idle (amplitude damping `1/T1` + pure dephasing `Tφ` from
+  `1/T2 = 1/(2T1)+1/Tφ`), per-gate depolarizing (`p1/p2`), readout flip (`p_ro`),
+  pre-measure depolarizing (`p_meas`), spectator-qubit idle during every
+  gate/readout.
+
+The IBM path is selected by passing `calib=carried_calib(<carry-qubit>)` (the §8.3
+`--ibm` default); a flat `_DEFAULT_CALIB` (`calib="unit"`) path serves unit checks.
+
+Two model rules are **normative**:
+
+1. **Leakage is charged per 2q gate** (§4.1). On each 2q gate (`cnot`, `toffoli`) the
+   target is marked `leaked` with probability `lam·p_leak` — the §3.6
+   `F1_nt=(1-p_leak)^n2q` mechanism. There is **no** per-idle-second leakage term
+   (no `T_leak` time-constant). A `reset`/cut-reprep clears `leaked`. `lam=0` is
+   exactly noiseless, and the `p_leak=0` case must reproduce the noiseless numbers (a
+   `validate.py` gate).
+2. **KNIT delivered fidelity** clamps the reconstructed Bloch vector to `|a| ≤ 1`
+   before `F = ½(1 + a·n_ideal)` — its `a` is a weight-summed estimate that can be
+   non-physical at finite shots — and the arm is labelled **"reconstructed"** in the
+   §8.2 legend.
+
+The flat `_DEFAULT_CALIB` / `calib="unit"` path is reserved for unit-style checks;
+the `--ibm` dataset path is the default for the study.
+
 ---
 
 ## 6. Benchmarks (PennyLane/Catalyst → MLIR)
@@ -715,20 +754,20 @@ and execute the refresh arm, whose output lowers without new runtime.)
 
 ### 9.1 Frontend & lowering requirements
 
-**The benchmarks are already expressible in Catalyst** — the `@qjit` forms use
-`@while_loop` (dynamic, measurement-conditioned loop), `measure` (mid-circuit),
-`qml.cond` (feedforward), and a never-measured target wire that crosses the
-`scf.while` carry un-measured (the CARRY slot, §3.1). Ancillas are reset-and-reused
-via `qml.cond(m, PauliX)`, not per-iteration allocation (fixed device register).
-The only friction is compile time (a Toffoli gadget qjit'd in >500 s) — a
-performance, not an expressibility, gap.
+**The benchmarks are expressible in Catalyst** — the `@qjit` forms use `@while_loop`
+(dynamic, measurement-conditioned loop), `measure` (mid-circuit), `qml.cond`
+(feedforward), and a never-measured target wire that crosses the `scf.while` carry
+un-measured (the CARRY slot, §3.1). Ancillas are reset-and-reused via
+`qml.cond(m, PauliX)`, not per-iteration allocation (fixed device register).
+Toffoli-heavy gadgets can be slow to `qjit` — a performance, not an expressibility,
+concern.
 
 Requirements split by which side of the pass they touch:
 
-**Input side — feeding `--purl` (met today, no lowering change).** Catalyst already
-lowers `@qjit`+`while_loop`+`measure`+`cond` to quantum-dialect `scf.while` with
+**Input side — feeding `--purl` (no lowering change required).** Catalyst lowers
+`@qjit`+`while_loop`+`measure`+`cond` to quantum-dialect `scf.while` with
 register-threaded qubits, tensor-wrapped classical values, and
-`stablehlo`/`tensor.extract` glue — the shape §3.1–3.3 are written for. Capture it
+`stablehlo`/`tensor.extract` glue — the shape §3.1–3.3 must handle. Capture it
 with `keep_intermediate`/`catalyst-cli`, then `quantum-opt --purl`. The one
 constraint is **pass ordering**: `--purl` must run while MCM is still
 `quantum.measure` + `scf.while` — *before* `dynamic-one-shot` rewrites measurements
@@ -743,13 +782,11 @@ per §9):**
    measure + conditional-X (§3.7c). A native reset op would be cleaner (optional).
 3. **Catalyst-faithful carry surgery** — the counter (`i32`) and KNIT weight (`f64`)
    added to the `scf.while` carry must follow the **tensor-wrapped classical
-   convention** (`tensor<...>` + `from_elements`/`extract`), or the transformed IR
-   fails to re-lower (bufferization → LLVM). Most likely breakage point.
-   **PoC status:** the current rewrite deliberately emits **bare `i32`/`f64`**
-   carries into the real IR — valid MLIR that the pass and `--analyze-only` consume
-   and that the §5 study never re-lowers, so the `from_elements`/`extract` plumbing
-   is *deferred work, not a silent bug*. An implementer targeting execution must add
-   it here.
+   convention** (`tensor<...>` + `from_elements`/`extract`) for the transformed IR to
+   re-lower (bufferization → LLVM). This is the main re-lowering risk. For the
+   analysis-and-study scope (which does not re-lower, §9), the rewrite may emit bare
+   `i32`/`f64` carries — valid MLIR the pass and `--analyze-only` consume; targeting
+   execution requires the tensor-wrapped form here.
 4. **Profile & placement metadata in the IR** — to retire the `p`/`shots`/`sigma0`/
    `carry-qubit` options (§3.0): a `while_loop` success-rate attribute (`p`),
    observable variance (`sigma0`), shots from the qjit config, and a wire→physical
