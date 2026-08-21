@@ -21,6 +21,7 @@
 #include "Mitigation/Transforms/Passes.h"
 #include "PBC/Transforms/Passes.h"
 #include "PauliFrame/Transforms/Passes.h"
+#include "Purl/Transforms/Passes.h"
 #include "QRef/Transforms/Passes.h"
 #include "QecPhysical/Transforms/Passes.h"
 #include "Quantum/Transforms/Passes.h"
@@ -40,6 +41,7 @@ inline void registerAllPasses()
     mitigation::registerMitigationPasses();
     pauli_frame::registerPauliFramePasses();
     pbc::registerPBCPasses();
+    purl::registerPurlPasses();
     qecp::registerQecPhysicalPasses();
     qref::registerQRefPasses();
     quantum::registerQuantumPasses();
