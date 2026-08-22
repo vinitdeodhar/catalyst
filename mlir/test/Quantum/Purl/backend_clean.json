@@ -1,0 +1,4 @@
+{ "gate_1q":30e-9, "gate_2q":60e-9, "readout":1e-6, "tau":1e-6,
+  "T1":2e-3, "T2":2e-3,
+  "p1":1e-5, "p2":1e-5, "p_ro":1e-4, "p_meas":1e-5,
+  "p_leak":0, "p_leak_ro":0, "p_prep":1e-4 }
