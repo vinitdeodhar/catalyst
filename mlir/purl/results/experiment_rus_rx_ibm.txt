@@ -1,0 +1,30 @@
+=== Purl experiment: UNBOUNDED vs KNIT(g4) vs REFRESH(g1) ===
+benchmark rus_rx_ibm   p=0.625   calib: IBM Eagle r3 (qubit 0, p_leak/2q=0.001)
+  T1=176us  T2=202us  readout=1200ns  2q_err=8.1e-03  p_leak/2q=1.0e-03  B=12 layers/body   window=[4,2]
+  knit  cut (g4): window EMPTY (C_min=4 > C_max=2) -> KNIT inadmissible (divergent variance); reported n/a
+  refresh   (g1): C = 2   (2 iters = 24 layers)  [no variance floor -> tight bound]
+  refresh C-sweep (lam=1): best C* = 2 (F=0.9793); window [1,2] brackets C*  [S4]
+
+bench[config]                 |   lam |                 runtime coherent depth (unbounded) |                  fidelity (mean, seed-std)
+                              |       | depth/iter min_iters mean_iters max_iters  runtime_depth |   unbounded        knit(g4)*     refresh(g1)
+rus_rx_ibm[p=0.625,Cr=2,B=12] |  0.00 |         12         1       1.59        10             19 |      0.9936              n/a   0.9971±0.0116
+rus_rx_ibm[p=0.625,Cr=2,B=12] |  0.25 |         12         1       1.60        13             19 |      0.9941              n/a   0.9931±0.0091
+rus_rx_ibm[p=0.625,Cr=2,B=12] |  0.50 |         12         1       1.60        13             19 |      0.9897              n/a   0.9882±0.0082
+rus_rx_ibm[p=0.625,Cr=2,B=12] |  1.00 |         12         1       1.60        13             19 |      0.9775              n/a   0.9793±0.0080
+rus_rx_ibm[p=0.625,Cr=2,B=12] |  2.00 |         12         1       1.60        11             19 |      0.9569              n/a   0.9593±0.0070
+rus_rx_ibm[p=0.625,Cr=2,B=12] |  4.00 |         12         1       1.60        11             19 |      0.9149              n/a   0.9171±0.0062
+
+legend:
+  lam            global noise scale (0 = noiseless, 1 = calibrated device, 2/4 = noisier)
+  depth/iter     B = 12 gate-layers per loop body (the pass's purl.body_layers)
+  number_of_iterations  realized trip count per shot = the carried qubit's RUNTIME coherent
+                 depth in loop iterations (unbounded arm); min_iters / mean_iters / max_iters over shots
+  runtime_depth  mean_iters x depth/iter, the mean runtime coherent depth in gate-layers
+  fidelity       delivered-state Bloch fidelity vs the ideal state (higher = better),
+                 shown mean +/- seed-std over seeds
+  arms           unbounded = no cutting (control);  refresh(g1) = deterministic gamma=1 cut
+                 (proven known state, zero-variance);  knit(g4) = general gamma^2=16 cut
+  knit(g4)*      *reconstructed: the weight-summed Bloch vector is clipped to |a|<=1 (spec 5.1);
+                 shown n/a where the KNIT variance window is empty (C_min > C_max)
+
+wrote /home/vadeo/catalyst/mlir/purl/eval/../results/experiment.csv
