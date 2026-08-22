@@ -1065,6 +1065,90 @@ static ObsChain findObsChain(scf::WhileOp loop, int carryResultIdx)
     return oc;
 }
 
+//===----------------------------------------------------------------------===//
+// Register-threaded carry (real Catalyst IR shape, Part 3.1 / 9.1).
+//
+// Catalyst threads qubits through a !quantum.reg carry, not a bare !quantum.bit.
+// A *held* carried wire is a register slot that (a) is delivered to the observable
+// by a post-loop extract, and (b) is never extracted inside the body (untouched ->
+// its per-iteration action is exactly the identity). That is the RUS/held-memory
+// shape; the coin ancillas live in other slots.
+//===----------------------------------------------------------------------===//
+struct RegCarry {
+    int carryYieldIdx = -1; // scf.yield operand index of the QuregType carry
+    int64_t slot = -1;      // held carried wire index within the register
+    bool ok = false;
+};
+
+static RegCarry findRegisterCarry(scf::WhileOp loop)
+{
+    RegCarry rc;
+    Block &body = loop.getAfter().front();
+
+    // the delivered register result (QuregType) and the slots the body touches
+    Value regResult;
+    for (OpResult r : loop.getResults())
+        if (isa<QuregType>(r.getType())) {
+            regResult = r;
+            break;
+        }
+    if (!regResult)
+        return rc;
+    llvm::DenseSet<int64_t> touched;
+    body.walk([&](ExtractOp ex) {
+        if (auto i = ex.getIdxAttr())
+            touched.insert((int64_t)*i);
+    });
+
+    // a post-loop extract[slot] feeding a namedobs, whose slot the body never
+    // touches -> a held carried wire
+    for (Operation *u : regResult.getUsers()) {
+        auto ex = dyn_cast<ExtractOp>(u);
+        if (!ex)
+            continue;
+        auto idx = ex.getIdxAttr();
+        if (!idx || touched.count((int64_t)*idx))
+            continue;
+        for (Operation *u2 : ex.getQubit().getUsers())
+            if (isa<NamedObsOp>(u2)) {
+                // yield operand index of the register (the QuregType yield operand)
+                auto yield = cast<scf::YieldOp>(body.getTerminator());
+                for (unsigned i = 0; i < yield.getNumOperands(); ++i)
+                    if (isa<QuregType>(yield.getOperand(i).getType())) {
+                        rc.carryYieldIdx = (int)i;
+                        break;
+                    }
+                rc.slot = (int64_t)*idx;
+                rc.ok = rc.carryYieldIdx >= 0;
+                return rc;
+            }
+    }
+    return rc;
+}
+
+// Capture the |psi0> prep of a held register slot: trace the loop's init register
+// back through insert(idx=slot) to the prepared wire, then reuse captureInputPrep.
+static PrepChain captureInputPrepReg(scf::WhileOp loop, int64_t slot)
+{
+    Value regInit;
+    for (Value in : loop.getInits())
+        if (isa<QuregType>(in.getType())) {
+            regInit = in;
+            break;
+        }
+    Value r = regInit;
+    llvm::DenseSet<Value> seen;
+    while (r && seen.insert(r).second) {
+        auto ins = r.getDefiningOp<InsertOp>();
+        if (!ins)
+            break;
+        if (auto i = ins.getIdxAttr(); i && (int64_t)*i == slot)
+            return captureInputPrep(ins.getQubit());
+        r = ins.getInQreg();
+    }
+    return PrepChain{};
+}
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -1108,6 +1192,15 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         }
 
         LoopInfo info = classify(loop);
+        // Real Catalyst IR threads qubits through a !quantum.reg carry; if the bare
+        // per-wire analysis found no carry, look for a held register slot (3.1/9.1).
+        RegCarry rc = findRegisterCarry(loop);
+        if (info.klass != Klass::Carry && rc.ok) {
+            info.klass = Klass::Carry;
+            info.carrySlot = (int)rc.slot;
+            info.carrySlots.assign(1, (int)rc.slot);
+            info.carryArgIdx = -1; // register-threaded (no bare-qubit body arg)
+        }
         StringRef klassStr = info.klass == Klass::Carry     ? "carry"
                              : info.klass == Klass::Restart ? "restart"
                                                             : "unknown";
@@ -1151,6 +1244,16 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
                            : fr.kind == Known::KnownPauli ? "pauli"
                                                           : "none";
             loop->setAttr("purl.known_state", b.getStringAttr(ks));
+        }
+        else if (rc.ok) {
+            // Held register slot: the body never touches it, so its per-iteration
+            // action is exactly the identity -> provably known. The prep is the
+            // wire inserted into the register before the loop. No gates on it, so
+            // n1qCarry = n2qCarry = 0.
+            fr = FrameResult{Known::Identity, 'I'};
+            prep = captureInputPrepReg(loop, rc.slot);
+            tier1 = prep.ok;
+            loop->setAttr("purl.known_state", b.getStringAttr("identity"));
         }
 
         Window wKnit = cutWindow(pSuccess, B, c, budgetFraction);
@@ -1249,14 +1352,25 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
             loop.emitRemark("purl: not profitable; loop left unchanged");
             return;
         }
-        if (info.carryArgIdx < 0) {
-            loop.emitRemark("purl: register-threaded carry; analyses only");
-            return;
-        }
         Window wSel{wLo, wKnit.cMax};
-        bool ok = strat == CutStrategy::Refresh
-                      ? doRewriteDeterministic(loop, info.carryArgIdx, C, wSel, fr, prep)
-                      : doRewrite(loop, info.carryArgIdx, C, wSel);
+        bool ok;
+        if (info.carryArgIdx < 0) {
+            // register-threaded carry (real Catalyst IR). Only the gamma=1 refresh
+            // path supports it today (extract held wire -> qcut -> re-insert); the
+            // gamma=4 knit-on-register path is not yet implemented.
+            if (!rc.ok || strat != CutStrategy::Refresh) {
+                loop.emitRemark("purl: register-threaded carry; refresh-only, "
+                                "analyses done");
+                return;
+            }
+            ok = doRewriteDeterministic(loop, rc.carryYieldIdx, C, wSel, fr, prep,
+                                        (int)rc.slot);
+        }
+        else {
+            ok = strat == CutStrategy::Refresh
+                     ? doRewriteDeterministic(loop, info.carryArgIdx, C, wSel, fr, prep)
+                     : doRewrite(loop, info.carryArgIdx, C, wSel);
+        }
         if (!ok)
             loop.emitRemark("purl: output is not an expval of the carried "
                             "qubit; rewrite skipped");
@@ -1468,15 +1582,23 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
     // re-prepare the known state |psi0> (+ a counter-parity Pauli for the
     // KnownPauli case). No @purl_sample_term, no weight, no variance.
     bool doRewriteDeterministic(scf::WhileOp loop, int carryIdx, int C,
-                                Window win, FrameResult fr, PrepChain prep)
+                                Window win, FrameResult fr, PrepChain prep,
+                                int slot = -1)
     {
         OpBuilder b(loop);
         Location loc = loop.getLoc();
+        MLIRContext *ctx = b.getContext();
         Type i32 = b.getI32Type();
 
-        ObsChain oc = findObsChain(loop, carryIdx);
-        if (!oc.ok)
-            return false;
+        // slot < 0: bare-qubit carry (needs an expval on the carried result to
+        // legalize). slot >= 0: register-threaded carry (findRegisterCarry already
+        // confirmed a held observed slot; refresh keeps the expval intact).
+        ObsChain oc;
+        if (slot < 0) {
+            oc = findObsChain(loop, carryIdx);
+            if (!oc.ok)
+                return false;
+        }
         int failIdx = failIndex(loop);
         unsigned nCarry = loop.getNumResults();
 
@@ -1551,14 +1673,19 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
                 arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, amask, one);
         }
 
-        Value carriedQ = amap.lookupOrDefault(oldYield.getOperand(carryIdx));
+        Value carriedVal = amap.lookupOrDefault(oldYield.getOperand(carryIdx));
         auto cutIf = scf::IfOp::create(
             b, loc, docut,
             [&](OpBuilder &tb, Location l) {
                 // emit the abstract refresh cut (spec 3.7): measure + reset + replay
                 // the |psi0> prep region; --purl-lower-qcut expands it. The KnownPauli
-                // counter-parity correction stays here (it is analysis-driven).
-                QCutOp qc = emitQCut(tb, l, Strategy::refresh, carriedQ,
+                // counter-parity correction stays here (it is analysis-driven). For a
+                // register carry, extract the held wire, cut it, and re-insert.
+                Value toCut = carriedVal;
+                if (slot >= 0)
+                    toCut = ExtractOp::create(tb, l, QubitType::get(ctx), carriedVal,
+                                              Value(), tb.getI64IntegerAttr(slot));
+                QCutOp qc = emitQCut(tb, l, Strategy::refresh, toCut,
                                      /*inW=*/Value(), Pauli::Z, Pauli::none, &prep);
                 Value psi = qc.getOutQubit();
                 if (knownPauli)
@@ -1566,10 +1693,14 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
                                   [&](OpBuilder &gb, Value in) {
                                       return gate(gb, l, pName, in);
                                   });
-                scf::YieldOp::create(tb, l, ValueRange{psi});
+                Value out = psi;
+                if (slot >= 0)
+                    out = InsertOp::create(tb, l, carriedVal.getType(), carriedVal,
+                                           Value(), tb.getI64IntegerAttr(slot), psi);
+                scf::YieldOp::create(tb, l, ValueRange{out});
             },
             [&](OpBuilder &eb, Location l) {
-                scf::YieldOp::create(eb, l, ValueRange{carriedQ});
+                scf::YieldOp::create(eb, l, ValueRange{carriedVal});
             });
         Value newQ = cutIf.getResult(0);
 
