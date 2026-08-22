@@ -51,6 +51,8 @@ from catalyst.passes.builtin_passes import (
     ppm_specs,
     ppr_to_mbqc,
     ppr_to_ppm,
+    purl,
+    purl_lower_qcut,
     reduce_t_depth,
     to_ppr,
 )
@@ -69,6 +71,8 @@ __all__ = (
     "decompose_arbitrary_ppr",
     "combine_global_phases",
     "cancel_inverses",
+    "purl",
+    "purl_lower_qcut",
     "merge_rotations",
     "parity_synth",
     "diagonalize_measurements",

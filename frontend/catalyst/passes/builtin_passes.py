@@ -151,6 +151,86 @@ cancel_inverses = qp.transform(
 )
 
 
+def purl_setup_inputs(
+    calib: str = "",
+    p: float = 0.625,
+    shots: int = 0,
+    margin: float = 1.0,
+    sigma0: float = 1.0,
+    C: int = 0,
+    f: float = 0.05,
+    depth: int = 0,
+):
+    """
+    Specify that the ``--purl`` MLIR compiler pass should be applied to the
+    decorated QNode during :func:`~.qjit` compilation.
+
+    Purl detects *carry-type* dynamic quantum loops (a live qubit held across a
+    measurement-conditioned ``while`` loop), selects a cut strategy from a
+    hardware cost model, and -- when profitable -- emits an abstract ``purl.qcut``
+    op that bounds the carried wire's coherent depth (see ``doc/specs/PURL_SPEC.md``).
+    Pair with :func:`~.purl_lower_qcut` to expand the ``purl.qcut`` into its
+    concrete op sequence.
+
+    Args:
+        calib (str): Path to the hardware calibration JSON (or ``"unit"``); ``""``
+            uses unit weights.
+        p (float): RUS per-iteration success probability.
+        shots (int): Shot budget S. ``0`` fires the best applicable mechanism with
+            no profitability veto; ``>0`` runs the cost model.
+        margin (float): Profitability margin: a cut fires iff
+            ``predicted * margin < predicted(NONE)``.
+        sigma0 (float): Per-shot standard deviation of the observable.
+        C (int): Override the cut period (``0`` = cost-model choice).
+        f (float): Coherence-budget fraction for ``C_max``.
+        depth (int): Report ``purl.fidelity_at_depth`` at this runtime depth in
+            iterations (``0`` = off).
+
+    Returns:
+        :class:`QNode <pennylane.QNode>`
+
+    .. note::
+        The placement input ``carry-qubit`` and the hardware knob ``p-leak`` are
+        not exposed here (in a real pipeline they come from the calibration / a
+        mapping pass); apply them directly via :func:`~.apply_pass` if needed
+        (e.g. ``apply_pass("purl", **{"carry-qubit": 3})``). ``--purl`` must run
+        before ``dynamic-one-shot``, gate decomposition, and placement (spec §9.1).
+    """
+    return (), {
+        "calib": calib,
+        "p": p,
+        "shots": shots,
+        "margin": margin,
+        "sigma0": sigma0,
+        "C": C,
+        "f": f,
+        "depth": depth,
+    }
+
+
+purl = qp.transform(pass_name="purl", setup_inputs=purl_setup_inputs)
+
+
+def purl_lower_qcut_setup_inputs():
+    """
+    Specify that the ``--purl-lower-qcut`` MLIR compiler pass should be applied to
+    the decorated QNode during :func:`~.qjit` compilation.
+
+    Mechanically expands each ``purl.qcut`` emitted by :func:`~.purl` into its
+    concrete op sequence (refresh: measure + reset + re-prep; knit: the
+    quasi-probability cut). Run it after :func:`~.purl`.
+
+    Returns:
+        :class:`QNode <pennylane.QNode>`
+    """
+    return (), {}
+
+
+purl_lower_qcut = qp.transform(
+    pass_name="purl-lower-qcut", setup_inputs=purl_lower_qcut_setup_inputs
+)
+
+
 def diagonalize_measurements_setup_inputs(
     supported_base_obs: tuple[str, ...] = ("PauliZ", "Identity"),
     to_eigvals: bool = False,

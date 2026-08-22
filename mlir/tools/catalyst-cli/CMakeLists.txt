@@ -35,6 +35,8 @@ set(LIBS
     qref-transforms
     MLIRPBC
     pbc-transforms
+    MLIRPurl
+    purl-transforms
     MLIRGradient
     gradient-transforms
     MLIRMBQC
