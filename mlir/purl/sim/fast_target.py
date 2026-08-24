@@ -45,10 +45,11 @@ def _hold(sim, dt, touch):
         sim.touch_2q(0)
 
 
-def fast_unbounded(rng, calib, lam, N=1, basis="Z", p=P, touch=False):
+def fast_unbounded(rng, calib, lam, N=1, basis="Z", p=P, touch=False,
+                   prep=_prep_psi0):
     c = load_calib(calib)
     sim = QSim(1, calib=c, lam=lam, rng=rng)
-    _prep_psi0(sim)
+    prep(sim)
     dt = _dt_iter(c)
     ktot = 0
     for _ in range(N):
@@ -76,10 +77,11 @@ def fast_truncated(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False):
     return _read(sim, 0, basis), ktot, False
 
 
-def fast_knit(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False):
+def fast_knit(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False,
+              prep=_prep_psi0):
     c = load_calib(calib)
     sim = QSim(1, calib=c, lam=lam, rng=rng)
-    _prep_psi0(sim)
+    prep(sim)
     dt = _dt_iter(c)
     w = 1.0
     ktot, ncut = 0, 0
@@ -94,7 +96,8 @@ def fast_knit(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False):
     return w * _read(sim, 0, basis), ktot, ncut, w
 
 
-def fast_refresh(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False):
+def fast_refresh(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False,
+                 prep=_prep_psi0):
     """The cheap deterministic gamma=1 REFRESH cut (proven-known-state): every C
     failing iterations, measure (end segment) + force |0> (clear leakage) +
     re-prepare the KNOWN state |psi0>. Weight is identically 1 -> ZERO sampling
@@ -102,7 +105,7 @@ def fast_refresh(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False):
     the pass proved the carried state is |psi0>."""
     c = load_calib(calib)
     sim = QSim(1, calib=c, lam=lam, rng=rng)
-    _prep_psi0(sim)
+    prep(sim)
     dt = _dt_iter(c)
     ktot, ncut = 0, 0
     for _ in range(N):
@@ -112,7 +115,7 @@ def fast_refresh(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False):
             if i < k and i % C == 0:
                 sim.measure(0)            # end the coherent segment
                 sim.force_zero(0)         # fresh |0>, clears leakage
-                _prep_psi0(sim)           # re-prepare the known |psi0>
+                prep(sim)                 # re-prepare the known held state
                 ncut += 1
         ktot += k
     return _read(sim, 0, basis), ktot, ncut, 1.0
