@@ -172,19 +172,41 @@ def main():
           f"window [1,{C_max}] {'brackets' if brackets else 'does NOT bracket'} "
           f"C*  [S4]")
 
+    # analytical sampling-cost / resource metrics (metric families 2 & 3, spec 8.2.1)
+    q_ref = (1.0 - p) ** C_refresh
+    ecuts = q_ref / (1.0 - q_ref) if q_ref < 1.0 else float("inf")
+    # KNIT sampling cost at its operating point: the variance-cap floor C_min if the
+    # window is non-empty, else the tightest coherence-allowed cut C_max (where the
+    # variance diverges -- that is *why* knit is inadmissible).
+    knit_C = C_min if knit_ok else C_max
+    v_knit = variance_V(knit_C, p) if knit_C >= 1 else float("inf")
+    v_str = "inf (diverges)" if math.isinf(v_knit) else f"{v_knit:.1f}"
+    v_note = "admissible" if knit_ok else "> C_max -> KNIT inadmissible"
+    print(f"  sampling cost:  V(C={knit_C}) = {v_str}  (KNIT variance inflation; "
+          f"C_min={C_min} {v_note});  E[#cuts]@C_refresh = {ecuts:.2f}")
+    print(f"  bounded cap:    refresh coherent depth <= C_refresh*B = "
+          f"{C_refresh*B} gate-layers (compile-time guarantee)")
+
     os.makedirs(RESULTS, exist_ok=True)
     out = os.path.join(RESULTS, "experiment.csv")
     fh = open(out, "w", newline="")
     w = csv.writer(fh)
     w.writerow(["benchmark", "lam", "p", "C_knit", "C_refresh", "B_layers",
-                "depth_per_iter", "min_number_of_iterations",
-                "mean_number_of_iterations", "max_number_of_iterations",
-                "runtime_depth", "fidelity_unbounded", "fidelity_knit",
-                "fidelity_refresh", "std_knit", "std_refresh", "knit_admissible"])
+                "depth_per_iter", "min_iters", "mean_iters", "max_iters",
+                "runtime_depth", "bounded_cap_layers", "fidelity_unbounded",
+                "fidelity_knit", "fidelity_refresh", "std_knit", "std_refresh",
+                "knit_admissible", "rmse_unbounded", "rmse_refresh",
+                "delta_rmse_ref_minus_unb", "best_arm"])
 
-    # short benchmark+config tag carried in every row
+    def _rmse(F, s):
+        # delivered-state RMSE (accuracy, family 1): systematic infidelity (bias)
+        # combined in quadrature with the statistical seed-std.
+        return float(((1.0 - F) ** 2 + s * s) ** 0.5)
+
     tag = f"{args.bench}[p={p:g},Cr={C_refresh},B={B}]"
     tw = max(len(tag), 22)
+
+    # --- table 1: runtime coherent depth + delivered fidelity ---
     print(f"\n{'bench[config]':<{tw}} | {'lam':>5} | "
           f"{'runtime coherent depth (unbounded)':>50} | "
           f"{'fidelity (mean, seed-std)':>42}")
@@ -192,10 +214,11 @@ def main():
           f"{'min_iters':>9} {'mean_iters':>10} {'max_iters':>9} "
           f"{'runtime_depth':>14} | "
           f"{'unbounded':>11} {'knit(g4)*':>16} {'refresh(g1)':>15}")
+    rows = []
     for lam in (0.0, 0.25, 0.5, 1.0, 2.0, 4.0):
         mk, nk, xk = depths(calib, lam, p, S, seeds, touch=touch, prep=prep)
-        fu, _ = bloch_fidelity(fast_unbounded, calib, lam, C, p, S, seeds,
-                               touch=touch, ideal=ideal, prep=prep)
+        fu, su = bloch_fidelity(fast_unbounded, calib, lam, C, p, S, seeds,
+                                touch=touch, ideal=ideal, prep=prep)
         fd, sd = bloch_fidelity(fast_refresh, calib, lam, C_refresh, p, S, seeds,
                                 touch=touch, ideal=ideal, prep=prep)
         if knit_ok:
@@ -209,34 +232,59 @@ def main():
         print(f"{tag:<{tw}} | {lam:5.2f} | {B:10d} "
               f"{nk:9d} {mk:10.2f} {xk:9d} {mk*B:14.0f} | "
               f"{fu:11.4f} {knit_cell:>16} {fd:8.4f}±{sd:.4f}")
+        rows.append((lam, mk, nk, xk, fu, su, fd, sd, fq_csv, sq_csv))
+
+    # --- table 2: tradeoff metrics -- accuracy (RMSE) + decision quality ---
+    print(f"\n{'bench[config]':<{tw}} | {'lam':>5} | {'bounded_cap':>11} | "
+          f"{'RMSE = delivered-state error (lower better)':>44}")
+    print(f"{'':<{tw}} | {'':>5} | {'(layers)':>11} | "
+          f"{'unbounded':>11} {'refresh(g1)':>13} {'d(ref-unb)':>11} {'best':>9}")
+    for (lam, mk, nk, xk, fu, su, fd, sd, fq_csv, sq_csv) in rows:
+        ru, rr = _rmse(fu, su), _rmse(fd, sd)
+        d = rr - ru
+        best = "refresh" if rr < ru else "unbounded"
+        print(f"{tag:<{tw}} | {lam:5.2f} | {C_refresh*B:11d} | "
+              f"{ru:11.4f} {rr:13.4f} {d:+11.4f} {best:>9}")
         w.writerow([args.bench, lam, p, (C if knit_ok else ""), C_refresh, B, B,
-                    nk, round(mk, 3), xk, round(mk * B, 1),
+                    nk, round(mk, 3), xk, round(mk * B, 1), C_refresh * B,
                     round(fu, 4), fq_csv, round(fd, 4), sq_csv, round(sd, 4),
-                    int(knit_ok)])
+                    int(knit_ok), round(ru, 4), round(rr, 4), round(d, 4), best])
     fh.close()
 
-    print("\nlegend:")
-    print("  lam            global noise scale (0 = noiseless, 1 = calibrated "
-          "device, 2/4 = noisier)")
-    print(f"  depth/iter     B = {B} gate-layers per loop body (the pass's "
-          f"purl.body_layers)")
-    print("  number_of_iterations  realized trip count per shot = the carried "
-          "qubit's RUNTIME coherent")
-    print("                 depth in loop iterations (unbounded arm); "
-          "min_iters / mean_iters / max_iters over shots")
-    print(f"  runtime_depth  mean_iters x depth/iter, the mean runtime coherent "
-          f"depth in gate-layers")
-    print("  fidelity       delivered-state Bloch fidelity vs the ideal state "
-          "(higher = better),")
-    print("                 shown mean +/- seed-std over seeds")
-    print("  arms           unbounded = no cutting (control);  "
-          "refresh(g1) = deterministic gamma=1 cut")
-    print("                 (proven known state, zero-variance);  knit(g4) = "
-          "general gamma^2=16 cut")
-    print("  knit(g4)*      *reconstructed: the weight-summed Bloch vector is "
-          "clipped to |a|<=1 (spec 5.1);")
-    print("                 shown n/a where the KNIT variance window is empty "
-          "(C_min > C_max)")
+    print("\nlegend (metrics beyond fidelity -- spec 8.2.1):")
+    print("  lam            global noise scale (0 = noiseless, 1 = device, 2/4 = "
+          "noisier)")
+    print(f"  depth/iter     B = {B} gate-layers per loop body (purl.body_layers)")
+    print("  *_iters        realized trip count = RUNTIME coherent depth (unbounded "
+          "arm); max_iters is")
+    print("                 the decohering TAIL; runtime_depth = mean_iters x B "
+          "[resource, family 3]")
+    print(f"  bounded_cap    C_refresh x B = {C_refresh*B} layers -- the compile-time "
+          f"coherent-depth CAP the cut")
+    print("                 guarantees, independent of any noise model [resource, "
+          "family 3]")
+    print("  fidelity       delivered-state Bloch fidelity F (higher=better), mean "
+          "+/- seed-std. arms:")
+    print("                 unbounded (control); refresh(g1) = deterministic gamma=1 "
+          "cut (proven state,")
+    print("                 zero variance); knit(g4) = gamma^2=16 quasi cut")
+    print("  knit(g4)*      *reconstructed (|a|<=1 clip, spec 5.1); n/a where the "
+          "KNIT variance window is")
+    print("                 empty -- see V(C_min) in the header [sampling cost, "
+          "family 2]")
+    print("  RMSE           delivered-state error sqrt((1-F)^2 + seed-std^2): "
+          "systematic infidelity (bias)")
+    print("                 + statistical spread [accuracy, family 1]. Lower better.")
+    print("  d(ref-unb)     RMSE(refresh) - RMSE(unbounded): <0 => cutting wins "
+          "(fire refresh); >=0 =>")
+    print("                 cutting does not pay (decline) [decision quality, "
+          "family 4]")
+    print("  best           arm with min measured RMSE (oracle); regret = "
+          "RMSE(pass-chosen) - RMSE(best)")
+    print("  header:        V(C_min) = KNIT variance inflation [family 2]; "
+          "E[#cuts] = expected cuts/shot")
+    print("                 [family 3]; refresh C-sweep vs window bracketing "
+          "[family 4, S4]")
     print(f"\nwrote {out}")
 
 

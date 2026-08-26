@@ -722,6 +722,44 @@ Columns: `benchmark[config]`, `lam`, runtime coherent depth of the unbounded arm
 strategy. A legend defines every column, the arms, and the units. Also write a
 CSV.
 
+### 8.2.1 Reported metrics (beyond fidelity)
+
+Purl is a **bias–variance–resource** tradeoff, so the eval reports four families of
+metrics, each with a legend, and writes them to the CSV. All are per
+`(benchmark, lam)` unless noted; `F` is the delivered-state Bloch fidelity and
+`sigma_F` its seed-std.
+
+**1. Estimator accuracy** — the user runs the loop to estimate `⟨O⟩`, so the error in
+that estimate is the bottom line.
+- `infidelity = 1 − F` — the delivered-state systematic error (bias).
+- `RMSE = sqrt((1−F)² + sigma_F²)` — the delivered-state root-mean-square error,
+  combining the systematic infidelity (bias) and the statistical spread `sigma_F`.
+  This is the *measured analog* of the §3.5 predicted `RMSE = sqrt(bias² +
+  statistical²)`: refresh has low bias **and** zero cut-variance → low RMSE; knit has
+  ~zero bias but inflated variance → high RMSE; unbounded has high bias.
+
+**2. Sampling cost** (why refresh ≫ knit; invisible to fidelity).
+- `V(C) = (1−q)/(1−gamma²·q)`, `q=(1−p)^C`, `gamma²=16` — the KNIT quasi-probability
+  variance-inflation factor. `V(C_min)` large/divergent is *why* KNIT is inadmissible.
+- `ESS = (Σw)²/Σw²` — effective sample size of the weighted KNIT estimator.
+- `E[|w|] = gamma^{E[#cuts]}` — mean |weight|, a direct sampling-cost proxy.
+- `shots-to-ε = sigma0²·V(C)/ε²` — shots KNIT needs to reach estimator error `ε`.
+
+**3. Resource / structural** (the pass's job; noise-independent).
+- `runtime_depth` — mean realized coherent depth of the unbounded arm
+  (`mean_iters × B` gate-layers); `max_iters` is the decohering **tail**.
+- `bounded_cap = C·B` — the compile-time coherent-depth **cap** the cut guarantees
+  (the core structural result, independent of any noise model).
+- `E[#cuts] = q/(1−q)` — expected cuts per shot (extra measure + reset + feedback).
+- `added_ops` — ops the rewrite inserts (counter/guard/qcut); a compile-time (IR)
+  quantity, measured by diffing op counts before/after `--purl`.
+
+**4. Decision quality** (grading the §3.5 cost model, not one arm).
+- `best_arm` — the arm with the minimum *measured* RMSE (the oracle).
+- `regret = RMSE(strategy) − RMSE(best_arm)` — how far the pass-selected strategy is
+  from optimal (`0` = the pass chose the best arm). The headline decision metric.
+- `predicted ≈ measured` (S3) and the window brackets `C*` (S4), as in §8.4.
+
 ### 8.3 Config
 Default `--ibm` (the §4 dataset), `--carry-qubit`, `--leak` (published estimate),
 `-S` (shots), `--seeds` (default **8**, for the seed-std error bars), `--f`
