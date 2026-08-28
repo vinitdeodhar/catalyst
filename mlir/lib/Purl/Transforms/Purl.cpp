@@ -821,8 +821,10 @@ static Window cutWindow(double p, double B, const Calib &c, double f)
 }
 
 //===----------------------------------------------------------------------===//
-// Time-based fidelity model (real hardware data). Predict the carried qubit's
-// delivered fidelity after being held for D loop iterations.
+// Depth-based fidelity model (real hardware data, spec 3.6). Delivered fidelity is
+// a function of the carried wire's coherent depth D alone: F(D) = rho^D, where the
+// per-iteration retention rho folds the coherence loss over one body's DURATION and
+// the gate error over one body's gate COUNT into one per-depth constant.
 //===----------------------------------------------------------------------===//
 
 // count 1q/2q gates ON the carried wire per body execution
@@ -847,26 +849,26 @@ static void countCarriedGates(Value carriedArg, int &n1q, int &n2q)
     }
 }
 
-// F(D) = e^{-t_idle/T1} e^{-t_idle/T2} (1-e1q)^{D n1q} (1-e2q)^{D n2q}
-//        (1-leak)^{D n2q},  t_idle = D (B + tau)
+//   rho  = exp(-(B+tau)/T2) (1-e1q)^n1q (1-e2q)^n2q (1-leak)^n2q   // per iteration
+//   F(D) = rho^D
+// Idle decay uses exp(-t/T2) ONLY -- 1/T2 already contains 1/(2 T1), so a separate
+// exp(-t/T1) factor would double-count (spec 3.6 / 4.2 enforces T2 <= 2 T1).
 static double predictFidelity(double D, const Calib &c, double Bsec, int n1q,
                               int n2q, double pLeak)
 {
     double tidle = D * (Bsec + c.tau);
     double F = 1.0;
-    if (!std::isinf(c.T1))
-        F *= std::exp(-tidle / c.T1);
     if (!std::isinf(c.T2))
-        F *= std::exp(-tidle / c.T2);
-    F *= std::pow(1.0 - c.p1, D * n1q);
+        F *= std::exp(-tidle / c.T2); // coherence loss over the held DURATION
+    F *= std::pow(1.0 - c.p1, D * n1q); // gate + leakage error over the held gate COUNT
     F *= std::pow(1.0 - c.p2, D * n2q);
     F *= std::pow(1.0 - pLeak, D * n2q);
     return F;
 }
 
 // mean delivered fidelity over the geometric trip distribution. Unbounded: the
-// carried qubit ages k iterations. Bounded/refresh at C: the delivered segment
-// age is ((k-1) mod C) + 1 (reset every C).
+// delivered coherent depth is k iterations. Bounded/refresh at C: the delivered
+// coherent depth is ((k-1) mod C) + 1 (reset every C).
 static double meanFidelity(const Calib &c, double Bsec, int n1q, int n2q,
                            double pLeak, double p, int C /* 0 = unbounded */)
 {
@@ -901,8 +903,9 @@ static EpsRates epsFromCalib(const Calib &c, double Bsec, const BodyStats &bs)
 {
     EpsRates e;
     double idle = 0.0;
-    if (!std::isinf(c.T1) && !std::isinf(c.T2))
-        idle = (Bsec + c.tau) * (1.0 / c.T1 + 1.0 / c.T2);
+    if (!std::isinf(c.T2))
+        idle = (Bsec + c.tau) / c.T2; // per-iteration idle coherence loss (eps_t ~
+                                      // 1-F1_t); T2 only -- 1/T2 holds 1/(2 T1) (3.6)
     // transportable: idle decoherence + gate depolarizing + pre-measure depol
     e.t = idle + bs.n1q * c.p1 + bs.n2q * c.p2 + bs.nro * c.p_meas;
     // non-transportable: leakage per 2q gate and per readout

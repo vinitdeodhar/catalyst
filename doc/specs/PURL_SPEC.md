@@ -235,9 +235,11 @@ Emit `purl.body_seconds` (or `purl.body_layers`).
 bounds the KNIT sampling overhead, not merely its finiteness: bare finiteness
 `γ²q < 1` is the `V_max → ∞` limit and recovers the closed form
 `ceil(ln(γ²)/ln(1/(1-p)))`.
-`C_max = floor(f·T2/(B+tau))` (coherence budget; `f` default **0.05**). Emit
-`purl.window=[C_min,C_max]`. The deterministic (refresh) strategy has **no**
-variance floor, so its window is `[1, C_max]`.
+`C_max = floor(f·T2/(B+tau))` (`f` default **0.05**) — equivalently a **coherent-depth
+cap**: the number of held iterations at which the idle retention `exp(-D·(B+tau)/T2)`
+falls to `exp(-f)`, i.e. the depth budget for a fraction `f` of idle coherence
+(§3.6). Emit `purl.window=[C_min,C_max]`. The deterministic (refresh) strategy has
+**no** variance floor, so its window is `[1, C_max]`.
 
 ### 3.4 Known-state proof (enables the cheap cut)
 Stabilizer / Pauli-frame tracking of the carried wire over the loop body: carry
@@ -261,8 +263,9 @@ single-iteration retention factors `F1_t` (transportable) and `F1_nt` (leakage):
 - `eps_cut = p_ro + p_prep`.
 
 With `q=(1-p)^C`, `E[k]=1/p`, `E[#cuts]=q/(1-q)`, `V(C)=(1-q)/(1-γ²q)` (`γ²=16`),
-and the expected delivered-state age
-`sbar(C) = Σ_{j≥1} p(1-p)^{j-1}·(((j-1) mod C) + 1)` (summed to convergence), the
+and the expected delivered **coherent depth**
+`sbar(C) = Σ_{j≥1} p(1-p)^{j-1}·(((j-1) mod C) + 1)` (summed to convergence; capped
+at `C`), the
 predicted expval error combines its bias and statistical terms **in quadrature**,
 `predicted = sqrt(bias² + statistical²)`, per strategy:
 
@@ -308,35 +311,79 @@ Both REFRESH and KNIT use the **single counter idiom**: the `i32` counter increm
 each failing iteration and **resets to 0 at every fired cut** (period `C`). KNIT's
 `f64` weight, by contrast, **accumulates across cuts** (it is never reset).
 
-### 3.6 Real-hardware fidelity prediction
-`calib` may be a **per-qubit + coupling-map** hardware dataset (§4). The carried
-wire's physical qubit (`carry-qubit`) supplies T1/T2/1q-err/readout; the median
-2q error comes from the coupling map. Predict the carried qubit's delivered
-fidelity at runtime iteration count `D` with a **time-based model**, factored into
-a **transportable** and a **leakage** part so §3.5 reuses the same numbers:
+### 3.6 Depth-based fidelity model
+
+Delivered fidelity is a function of the carried wire's **coherent depth `D`** — the
+number of iterations it is held un-cut (§1) — and of nothing else. Per held
+iteration the wire keeps a fixed fraction `rho` of its fidelity (the **per-iteration
+retention**), so a depth-`D` coherent chain delivers
+
+```
+rho  = F1_t · F1_nt          // per-iteration retention (one held iteration)
+F(D) = rho^D                 // fidelity depends only on coherent depth D
+```
+
+The retention is calibrated from the hardware and factored into a **transportable**
+and a **leakage** part:
 
 ```
 F1_t  = exp(-(B+tau)/T2) · (1-e1q)^n1q · (1-e2q)^n2q     // transportable, 1 iteration
 F1_nt = (1-p_leak)^n2q                                   // leakage, 1 iteration
-F(D)  = (F1_t)^D · (F1_nt)^D
 ```
 
-Symbols: `n1q,n2q` = per-iteration 1q/2q gate counts (§3.2); `e1q = gate_1q_err`,
-`e2q` = median incident `gate_2q_err`, `p_leak` from the `p-leak` knob (§4.1); the
-per-iteration idle time is `B+tau`, so `t_idle = D·(B+tau)`. Coherence decay uses
-**`exp(-t/T2)` only** — `1/T2` already contains the amplitude-damping term
-`1/(2·T1)` (exactly why §4.2 enforces `T2 ≤ 2·T1`), so a separate `exp(-t/T1)`
-factor would double-count it. The single-iteration factors `F1_t,F1_nt` are the
-source of §3.5's `eps_t = 1−F1_t`, `eps_nt = 1−F1_nt` — the decision and the
-prediction are one model.
+`rho` bundles *everything the wire loses per held iteration* — idle T1/T2
+decoherence over one body (`B+tau`), per-gate depolarizing, and per-2q leakage —
+into a single **per-depth constant**. Wall-clock time (via `T2`) is only the
+*source* of the idle part of `rho`; the model — and the pass — reason in **coherent
+depth**, not in time. (Symbols: `n1q,n2q` = per-iteration 1q/2q gate counts (§3.2);
+`e1q = gate_1q_err`, `e2q` = median incident `gate_2q_err`; `p_leak` from the
+`p-leak` knob (§4.1). Idle decay uses `exp(-t/T2)` only — `1/T2` already contains
+`1/(2·T1)` (why §4.2 enforces `T2 ≤ 2·T1`), so a separate `exp(-t/T1)` would
+double-count.)
 
-The prediction is at the **nominal `lam=1`** operating point (the simulator's global
-noise scale, §5); the pass has no `lam` knob, so `purl.predicted_fidelity` is
-comparable to the simulator only at `lam=1` — which is where S3 (§8.4) compares.
+**Why the pass optimizes for depth.** Since `F(D) = rho^D` is strictly decreasing in
+`D`, *maximizing delivered fidelity is exactly minimizing the carried wire's coherent
+depth.* The cut bounds that depth at the period `C`: it caps the **delivered** state's
+coherent depth (its age since the last cut) at `≤ C`, hence its error at `≤ 1−rho^C`,
+**regardless of the runtime trip count `k`**. The §3.3 window and the §3.5 strategy
+selection are all expressed in this depth / `rho^D` model — one model, so the pass's
+decision and its predicted fidelity cannot disagree (§3.5's `eps_t = 1−F1_t`,
+`eps_nt = 1−F1_nt` are the per-depth error).
 
-Emit `purl.predicted_fidelity = {unbounded, bounded}` — the **mean** delivered
-fidelity over the geometric trip distribution (unbounded age = k; bounded/refresh
-age = ((k-1) mod C)+1) — and, if `depth>0`, `purl.fidelity_at_depth`.
+The retention is evaluated at the **nominal `lam=1`** operating point (§5); the pass
+has no `lam` knob, so `purl.predicted_fidelity` is comparable to the simulator only
+at `lam=1` — which is where S3 (§8.4) compares.
+
+Emit `purl.predicted_fidelity = {unbounded, bounded}` — the **mean** `rho^D`
+delivered fidelity over the geometric trip distribution, where the delivered
+coherent depth `D` is the full trip count `k` for `unbounded` and the capped
+`((k-1) mod C)+1 ≤ C` for `bounded`/refresh — and, if `depth>0`,
+`purl.fidelity_at_depth`.
+
+**Gate depth ↔ coherence time (why one `rho` absorbs both).** The two error sources
+have different natural units: **gate error** (depolarizing, leakage) is *count*-based
+— `(1-e)^{#gates}`, geometric in the number of gates — while **coherence loss**
+(T1/T2) is *time*-based — `exp(-t/T2)`, exponential in elapsed time. They meet on a
+single axis because every held iteration is identical: it has a fixed **gate count**
+(`n1q, n2q`) **and** a fixed **duration** (`B+tau`), so time is proportional to depth,
+`t = D·(B+tau)`. Evaluating each source over one iteration and multiplying gives the
+per-depth retention
+
+```
+rho =  exp(-(B+tau)/T2)             // coherence loss over one body's DURATION
+     · (1-e1q)^n1q · (1-e2q)^n2q     // gate error over one body's gate COUNT
+     · (1-p_leak)^n2q                // leakage over one body's 2q gates
+```
+
+so `F(D) = rho^D` uses the coherence model (T2, via the idle factor) **and** the gate
+model (`e1q, e2q, p_leak`, via the count factors) at once. Bounding the coherent depth
+`D` therefore bounds **both** the accumulated idle time `D·(B+tau)` (T2 loss) and the
+accumulated gate count `D·n` (gate loss) — one knob, both error sources. Which term
+dominates is set by `n1q,n2q` vs `(B+tau)/T2`: a *held-idle* wire (`n ≈ 0`) is
+**coherence-dominated** (`rho ≈ exp(-(B+tau)/T2)`); a *gate-heavy* wire is
+**gate-count-dominated**. Consistently, the §3.3 window takes its ceiling `C_max` from
+the time source (the coherence budget) and its floor `C_min` from the count source
+(the sampling variance).
 
 ### 3.7 The `purl.qcut` op and its mechanical lowering
 
