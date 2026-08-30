@@ -6,6 +6,8 @@
  "readout_time": 1.2e-06,
  "tau": 1e-06,
  "p_prep": 0.001,
+ "leak_2q_default": 0.001,
+ "leak_source": "estimate, not vendor calibration (IBM does not publish leakage)",
  "qubits": [
   {
    "id": 0,

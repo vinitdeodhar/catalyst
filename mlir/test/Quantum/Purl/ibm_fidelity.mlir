@@ -1,11 +1,11 @@
-// RUN: quantum-opt --purl="calib=%S/ibm_eagle_r3.json p=0.1 shots=200000 p-leak=1e-3 carry-qubit=0 depth=10 analyze-only=true" %s | FileCheck %s
+// RUN: quantum-opt --purl="calib=%S/ibm_eagle_r3.json p=0.1 shots=200000 carry-qubit=0 depth=10 analyze-only=true" %s | FileCheck %s
 //
 // Real IBM Eagle r3 per-qubit hardware data (T1/T2/gate/readout for the carried
 // qubit + median 2q error) drives a TIME-BASED fidelity prediction. The carried
 // wire receives a CNOT each iteration and idles through the body; at the mean
 // (unbounded) trip count of a low-p heralded loop it decoheres substantially,
-// while a refresh cut bounds the held depth. Leakage is the separate p-leak knob
-// (published IBM estimate), not part of the device dataset.
+// while a refresh cut bounds the held depth. Leakage is calibration data now
+// (leak_2q_default in the dataset, spec 4.1), charged per 2q gate -- not a knob.
 
 // body depth is a real duration (seconds), computed from IBM gate/readout times
 // CHECK: purl.body_seconds

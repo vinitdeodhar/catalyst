@@ -173,7 +173,6 @@ shot config (see §9).
 |---|---|---|---|
 | `calib` | hardware | 3.2, 3.5, 3.6 | Path to the hardware calibration JSON (§4). Single source for depth-in-seconds, cost model, and fidelity prediction. |
 | `carry-qubit` | placement | 3.6 | Physical qubit index the carried wire maps to — a *selector* into `calib`, not a property. Chooses the per-qubit T1/T2/1q-err/readout (and 2q-err from its edges). Passed as an **option because of pass ordering** (see note below), not because it is device data. |
-| `p-leak` | hardware | 3.5 | Leakage per 2q gate — a **separate knob** (IBM doesn't publish it, §4). The non-Markovian, reset-clearable error the cut actually reduces. |
 | `f` | compiler | 3.3 | Coherence-budget fraction for the window ceiling `C_max = floor(f·T2/(B+tau))`. |
 | `C` | compiler | 3.5 | Override the cut period instead of letting the cost model pick the arg-min over the window. |
 | `margin` | compiler | 3.5 | Profitability guard: cut fires iff `predicted·margin < predicted(NONE)`. |
@@ -203,9 +202,12 @@ not-yet-assigned qubit.
 Note (dataset-sourced hardware, not options): not every model input is an option.
 The per-iteration classical **feedback latency `tau`** (the readout→controller→
 condition→dispatch round-trip the carried wire idles through each dynamic
-iteration) and the state-prep error `p_prep` arrive via the `calib` file — both are
-**top-level, control-system properties** (not per-qubit), so they ride in with
-`calib`/`carry-qubit` rather than as their own knobs. `tau` enters `B+tau`
+iteration), the state-prep error `p_prep`, and the per-2q-gate **leakage**
+(`leak_2q_default` / per-edge `leak_2q`, §4.1) all arrive via the `calib` file —
+`tau` and `p_prep` are **top-level control-system properties** and leakage is
+**per-edge calibration data**, so they ride in with `calib`/`carry-qubit` rather
+than as their own knobs. (Leakage was formerly a `p-leak` knob; it is now
+first-class calibration, single-sourced from the JSON.) `tau` enters `B+tau`
 everywhere it matters: body cost (3.2), the window ceiling `C_max` (3.3), and the
 idle time `t_idle=D·(B+tau)` (3.6).
 
@@ -258,7 +260,7 @@ so the §3.5 arg-min and the §3.6 fidelity ranking cannot disagree. From §3.6'
 single-iteration retention factors `F1_t` (transportable) and `F1_nt` (leakage):
 
 - `eps_t  = 1 − F1_t`  — **transportable** (depolarizing + T2 idle over `B+tau`);
-- `eps_nt = 1 − F1_nt` — **non-transportable** (leakage per 2q gate; `p-leak` knob);
+- `eps_nt = 1 − F1_nt` — **non-transportable** (leakage per 2q gate; `p_leak` from the §4.1 calibration);
 - `eps_all = 1 − F1_t·F1_nt ≈ eps_t + eps_nt`;
 - `eps_cut = p_ro + p_prep`.
 
@@ -336,8 +338,10 @@ decoherence over one body (`B+tau`), per-gate depolarizing, and per-2q leakage �
 into a single **per-depth constant**. Wall-clock time (via `T2`) is only the
 *source* of the idle part of `rho`; the model — and the pass — reason in **coherent
 depth**, not in time. (Symbols: `n1q,n2q` = per-iteration 1q/2q gate counts (§3.2);
-`e1q = gate_1q_err`, `e2q` = median incident `gate_2q_err`; `p_leak` from the
-`p-leak` knob (§4.1). Idle decay uses `exp(-t/T2)` only — `1/T2` already contains
+`e1q = gate_1q_err`, `e2q` = median incident `gate_2q_err`; `p_leak` = global median
+of `leak_2q` over the coupling map (`leak_2q_default` fills gaps), sourced from the
+§4.1 calibration; readout leakage `p_leak_ro = p_leak·0.5` is derived. Idle decay
+uses `exp(-t/T2)` only — `1/T2` already contains
 `1/(2·T1)` (why §4.2 enforces `T2 ≤ 2·T1`), so a separate `exp(-t/T1)` would
 double-count.)
 
@@ -554,20 +558,27 @@ All times are **SI seconds**; all error/probability fields are dimensionless in
 | `qubits[i].T2` | per-qubit | float > 0 | s | dephasing time (**≤ 2·T1**) |
 | `qubits[i].gate_1q_err` | per-qubit | float ∈ [0,1] | — | 1q depolarizing error |
 | `qubits[i].readout_err` | per-qubit | float ∈ [0,1] | — | readout bit-flip prob |
+| `leak_2q_default` | top | float ∈ [0,1] | — | **required** per-2q-gate leakage default (fills edges without an explicit value) |
+| `leak_source` | top | string | — | *optional* provenance note for the leakage numbers (written, not validated) |
 | `edges[k].q` | per-edge | `[int,int]` | — | undirected pair, `0 ≤ i<j < n_qubits` |
 | `edges[k].gate_2q_err` | per-edge | float ∈ [0,1] | — | 2q depolarizing error |
+| `edges[k].leak_2q` | per-edge | float ∈ [0,1] | — | *optional* per-edge leakage override (else `leak_2q_default`) |
 
-**Leakage is deliberately absent** — IBM does not publish it, and putting a
-guessed value in the dataset would let it be silently double-counted. It enters
-only as the separate `p-leak` knob (published estimate ~1e-3 per 2q gate) supplied
-to *both* the pass and the simulator; a loader that finds a `leakage`/`p_leak` key
-in the file **errors** (to force the single-source convention).
+**Leakage is calibration data** — it lives in the JSON like any other rate, not in
+a CLI knob. `leak_2q_default` is **required** (a device without a measured leakage
+number still states its assumed value explicitly); optional per-edge `leak_2q`
+overrides refine it. IBM does not publish leakage, so `leak_source` records where
+the number came from (an estimate, not vendor calibration). This single-sources
+leakage: the pass and the simulator both read it from the same file, so they cannot
+disagree. (The former `p-leak` / `--leak` knob is removed.)
 
 **Leakage is charged per 2q gate** — one mechanism, stated once here and referenced
 everywhere: the pass (§3.6, `F1_nt = (1-p_leak)^n2q`), the simulator (§5), and the
-§3.0 glossary all apply `p_leak` **per 2q gate**, not per idle-second. A per-second
-charge on one side and per-gate on the other would break S3 (predicted↔measured) by
-construction, so the per-2q-gate convention is normative.
+loader all apply `p_leak` **per 2q gate**, not per idle-second. A per-second charge
+on one side and per-gate on the other would break S3 (predicted↔measured) by
+construction, so the per-2q-gate convention is normative. The flattened per-qubit
+`p_leak` = **global median** of `leak_2q` over the coupling map (mirroring
+`gate_2q_err`), and readout leakage `p_leak_ro = p_leak·0.5` is derived.
 
 ### 4.2 Validation (loader-enforced)
 
@@ -580,18 +591,22 @@ The loader rejects a file (hard error) unless:
    `readout_err ∈ [0,1]`.
 4. every edge `q=[i,j]` has `0 ≤ i < j < n_qubits`; no duplicate undirected pair;
    `gate_2q_err ∈ [0,1]`.
-5. no `leakage`/`p_leak` key present (see §4.1).
+5. `leak_2q_default` is present and in `[0,1]`; every per-edge `leak_2q` (where
+   given) is in `[0,1]` (see §4.1).
 
 Non-fatal **warnings**: a disconnected coupling map; a qubit with no incident edge
 (its 2q error then falls back to the global median `gate_2q_err`); any per-qubit
-value deviating > 10× from the stated medians (typo guard).
+value deviating > 10× from the stated medians (typo guard); any per-edge `leak_2q`
+deviating > 10× from `leak_2q_default` (typo guard).
 
 The `--purl` `carry-qubit` index is validated against this file: it must satisfy
 `0 ≤ carry-qubit < n_qubits`, else the pass errors. **Loader → flat calib:** for
 the chosen qubit `k` it emits `{T1,T2,gate_1q_err,readout_err}` from `qubits[k]`,
-`gate_2q_err` = median over edges incident to `k` (global median if isolated), plus
-the top-level times/`tau`/`p_prep`. That flat dict is exactly what `Calib::load`
-and the simulator consume.
+`gate_2q_err` = **global median** of `gate_2q_err` over the coupling map, `p_leak` =
+**global median** of `leak_2q` (`leak_2q_default` filling gaps), `p_leak_ro =
+p_leak·0.5`, plus the top-level times/`tau`/`p_prep`. Both medians are global
+(device-representative), not restricted to edges incident to `k`. That flat dict is
+exactly what `Calib::load` and the simulator consume.
 
 ### 4.3 Complete valid example
 
@@ -610,6 +625,8 @@ schema-valid instance (5 qubits on a path; the shipped file scales this to
   "readout_time": 1.2e-6,
   "tau": 1.0e-6,
   "p_prep": 1.0e-3,
+  "leak_2q_default": 1.0e-3,
+  "leak_source": "estimate, not vendor calibration (IBM does not publish leakage)",
   "qubits": [
     { "T1": 2.51e-4, "T2": 1.48e-4, "gate_1q_err": 2.4e-4, "readout_err": 1.30e-2 },
     { "T1": 2.33e-4, "T2": 1.61e-4, "gate_1q_err": 2.6e-4, "readout_err": 1.42e-2 },
@@ -619,15 +636,16 @@ schema-valid instance (5 qubits on a path; the shipped file scales this to
   ],
   "edges": [
     { "q": [0, 1], "gate_2q_err": 7.8e-3 },
-    { "q": [1, 2], "gate_2q_err": 8.4e-3 },
+    { "q": [1, 2], "gate_2q_err": 8.4e-3, "leak_2q": 1.2e-3 },
     { "q": [2, 3], "gate_2q_err": 9.1e-3 },
     { "q": [3, 4], "gate_2q_err": 7.2e-3 }
   ]
 }
 ```
 
-(Every qubit above satisfies `T2 ≤ 2·T1`; every edge indexes a valid pair — the
-file passes §4.2.)
+(Every qubit above satisfies `T2 ≤ 2·T1`; every edge indexes a valid pair;
+`leak_2q_default` is present and one edge carries a per-edge `leak_2q` override —
+the file passes §4.2.)
 
 ---
 
@@ -638,7 +656,7 @@ stochastic channel sampling), independent of Catalyst at runtime.
 
 - **Op set:** alloc, h, x, z, s, sdg, t, cnot, toffoli, measure (Born + collapse),
   reset, force_zero (fresh qubit).
-- **Noise (parameterised by the §4 JSON + `p-leak` + a global scale `lam`∈[0,4]):**
+- **Noise (parameterised by the §4 JSON + a global scale `lam`∈[0,4]):**
   per-1q/2q depolarizing; readout flip + pre-measure depolarizing; **idle
   amplitude-damping + pure-dephasing** over the per-iteration idle time (from
   T1/T2); and **leakage** (population leaving the computational subspace, charged
@@ -661,13 +679,14 @@ The simulator is structured as a three-stage pipeline from the §4 dataset to th
 trajectory core:
 
 - **Generator** (`ibm_dataset.build_json`) — writes `ibm_eagle_r3.json` in the §4
-  schema (per-qubit `T1/T2/gate_1q_err/readout_err`, per-edge `gate_2q_err`,
-  top-level times/`tau`/`p_prep`).
+  schema (per-qubit `T1/T2/gate_1q_err/readout_err`, per-edge `gate_2q_err` and
+  optional `leak_2q`, top-level times/`tau`/`p_prep`/`leak_2q_default`). A leakage
+  sweep is done by generating **variant JSONs** (`eval/variants.py`), not a knob.
 - **Loader** (`ibm_dataset.carried_calib(qubit)`) — flattens the per-qubit +
   coupling JSON for the carried qubit onto the trajectory core's calib keys:
   `gate_1q_err→p1`, `median gate_2q_err→p2`, `readout_err→p_ro`,
-  `gate_1q_err→p_meas`, `T1/T2`, durations, `tau`, `p_prep`, and the separate
-  `p_leak` knob.
+  `gate_1q_err→p_meas`, `T1/T2`, durations, `tau`, `p_prep`, and `p_leak` = global
+  median of `leak_2q` (from the JSON, §4.1) — no `p_leak` argument.
 - **Trajectory core** (`qsim.QSim(n, calib, lam)`) — draws those rates into the
   noise model: T1/T2 idle (amplitude damping `1/T1` + pure dephasing `Tφ` from
   `1/T2 = 1/(2T1)+1/Tφ`), per-gate depolarizing (`p1/p2`), readout flip (`p_ro`),
@@ -750,7 +769,8 @@ table.
 ### 8.1 Per benchmark
 1. Build the `@qjit` program; lower to MLIR (`keep_intermediate` / `catalyst-cli`).
 2. Apply the Purl pass to that MLIR (`quantum-opt --purl calib=ibm_eagle_r3.json
-   p=<p> shots=<S> p-leak=<leak> carry-qubit=<q>`); parse `purl.strategy`,
+   p=<p> shots=<S> carry-qubit=<q>`; leakage rides in via the JSON, §4.1); parse
+   `purl.strategy`,
    `purl.C`, `purl.window`, `purl.predicted_fidelity`.
 3. For each noise scale `lam`, measure delivered fidelity with the §5 simulator
    (same JSON) for the arms **unbounded**, **refresh (g1)**, **knit (g4)**. If an
@@ -808,9 +828,10 @@ that estimate is the bottom line.
 - `predicted ≈ measured` (S3) and the window brackets `C*` (S4), as in §8.4.
 
 ### 8.3 Config
-Default `--ibm` (the §4 dataset), `--carry-qubit`, `--leak` (published estimate),
-`-S` (shots), `--seeds` (default **8**, for the seed-std error bars), `--f`
-(coherence-budget fraction, default **0.05**), and `lam ∈ {0, 0.25, 0.5, 1, 2, 4}`.
+Default `--ibm` (the §4 dataset), `--carry-qubit`, `--ibm-json` (calibration file;
+leakage sweeps via `eval/variants.py` variant files, §4.1), `-S` (shots), `--seeds`
+(default **8**, for the seed-std error bars), `--f` (coherence-budget fraction,
+default **0.05**), and `lam ∈ {0, 0.25, 0.5, 1, 2, 4}`.
 
 ### 8.4 Success criteria (paper claims)
 - **S1 — pipeline:** every benchmark lowers to MLIR and the pass applies to it,

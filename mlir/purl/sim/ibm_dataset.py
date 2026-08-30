@@ -13,17 +13,21 @@ processor papers (representative medians as of 2024 snapshots):
   * ECR 2q error median ~ 8e-3,        duration ~ 560 ns
   * readout error median ~ 1.3e-2,     duration ~ 1.2 us
   * feedback/reset latency (dynamic circuits) ~ 1 us
-NOTE: IBM's published properties do NOT include leakage; leakage is supplied
-SEPARATELY as a knob by the evaluation (see IBM_LEAK_PER_2Q), not stored here.
+Leakage IS stored here (spec 4.1): a REQUIRED top-level `leak_2q_default`
+(per-two-qubit-gate probability) with OPTIONAL per-edge `leak_2q` overrides, plus
+a `leak_source` provenance string. IBM does not publish leakage, so files record
+where the number came from. The old `--leak` / `p-leak` knob is GONE -- leakage is
+now single-source calibration data.
 
 `build_json()` writes ibm_eagle_r3.json (per-qubit + coupling, the schema the
 pass reads). `carried_calib(qubit)` extracts a flat calibration dict for the
-carried qubit (T1/T2/gate times/errors) usable by the pass and sim.qsim.
+carried qubit (T1/T2/gate times/errors/leakage) usable by the pass and sim.qsim.
 """
 
 import json
 import math
 import os
+import warnings
 
 N_QUBITS = 127
 
@@ -37,9 +41,9 @@ MED = {
     "p_prep": 1e-3,         # state-preparation error (reset+init)
 }
 
-# Published IBM leakage estimate (per 2q gate) -- NOT a standard property; used
-# by the evaluation as a separate knob (Eagle leakage characterizations report
-# ~0.1-0.3% per two-qubit gate).
+# Published IBM leakage estimate (per 2q gate) -- IBM does not publish leakage as a
+# standard property (Eagle characterizations report ~0.1-0.3% per two-qubit gate);
+# used as the generator's default `leak_2q_default` written into the JSON (spec 4.1).
 IBM_LEAK_PER_2Q = 1e-3
 
 _HERE = os.path.dirname(__file__)
@@ -86,7 +90,7 @@ def _heavy_hex_edges(n=N_QUBITS):
     return edges
 
 
-def build(seed_median=MED):
+def build(seed_median=MED, leak_2q_default=IBM_LEAK_PER_2Q, leak_spread=0.0):
     qubits = []
     for i in range(N_QUBITS):
         qubits.append({
@@ -99,10 +103,13 @@ def build(seed_median=MED):
     edges = _heavy_hex_edges()
     edge_list = []
     for j, (a, b) in enumerate(edges):
-        edge_list.append({
+        e = {
             "qubits": [a, b],
             "gate_2q_err": round(_spread(seed_median["gate_2q_err"], j + 100), 6),
-        })
+        }
+        if leak_spread > 0.0:              # optional per-edge leakage spread (spec 4.1)
+            e["leak_2q"] = round(_spread(leak_2q_default, j + 200, rel=leak_spread), 6)
+        edge_list.append(e)
     return {
         "device": "ibm_eagle_r3 (representative published medians)",
         "n_qubits": N_QUBITS,
@@ -111,13 +118,17 @@ def build(seed_median=MED):
         "readout_time": seed_median["readout_time"],
         "tau": seed_median["tau"],
         "p_prep": seed_median["p_prep"],
+        # leakage is first-class calibration data (spec 4.1): a REQUIRED default plus
+        # OPTIONAL per-edge overrides. IBM does not publish it -> record provenance.
+        "leak_2q_default": leak_2q_default,
+        "leak_source": "estimate, not vendor calibration (IBM does not publish leakage)",
         "qubits": qubits,
         "edges": edge_list,
     }
 
 
-def build_json(path=JSON_PATH):
-    data = build()
+def build_json(path=JSON_PATH, leak_2q_default=IBM_LEAK_PER_2Q, leak_spread=0.0):
+    data = build(leak_2q_default=leak_2q_default, leak_spread=leak_spread)
     with open(path, "w") as fh:
         json.dump(data, fh, indent=1)
     return path
@@ -135,12 +146,46 @@ def _median_2q_err(data):
     return errs[len(errs) // 2]
 
 
-def carried_calib(qubit=0, path=JSON_PATH, p_leak=IBM_LEAK_PER_2Q):
+def _median_leak(data):
+    """Global median per-two-qubit-gate leakage over all edges (leak_2q_default
+    fills edges without an explicit `leak_2q`), mirroring _median_2q_err. An
+    edgeless map -> the default. (spec 4.1/4.2)"""
+    dflt = data["leak_2q_default"]
+    vals = sorted(e.get("leak_2q", dflt) for e in data["edges"])
+    return vals[len(vals) // 2] if vals else dflt
+
+
+def _validate_leak(data):
+    """spec 4.2: `leak_2q_default` present and in [0,1] (hard error otherwise);
+    every per-edge `leak_2q` in [0,1]; warn on >10x deviation (typo guard)."""
+    if "leak_2q_default" not in data:
+        raise ValueError(
+            "calibration JSON missing required 'leak_2q_default': leakage moved "
+            "from the --leak / p-leak knob into the JSON (PURL_SPEC.md 4.1); "
+            "regenerate with ibm_dataset.build_json().")
+    dflt = data["leak_2q_default"]
+    if not 0.0 <= dflt <= 1.0:
+        raise ValueError(f"leak_2q_default {dflt} out of range [0,1]")
+    for e in data["edges"]:
+        if "leak_2q" not in e:
+            continue
+        v = e["leak_2q"]
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"edge leak_2q {v} out of range [0,1]")
+        if dflt > 0 and (v > 10 * dflt or v < 0.1 * dflt):
+            warnings.warn(
+                f"edge leak_2q {v} deviates >10x from leak_2q_default {dflt} "
+                "(possible typo)")
+
+
+def carried_calib(qubit=0, path=JSON_PATH):
     """Flat calibration for the CARRIED qubit (schema sim.qsim/the pass read).
 
-    T1/T2/readout/1q from qubit `qubit`; 2q error = device median; leakage from
-    the separate `p_leak` knob (default the published IBM estimate)."""
+    T1/T2/readout/1q from qubit `qubit`; 2q error and leakage = device (global)
+    medians over the coupling map. Leakage is read from the JSON (spec 4.1), not a
+    knob."""
     d = load(path)
+    _validate_leak(d)
     q = d["qubits"][qubit]
     return {
         "gate_1q": d["gate_1q_time"], "gate_2q": d["gate_2q_time"],
@@ -148,9 +193,9 @@ def carried_calib(qubit=0, path=JSON_PATH, p_leak=IBM_LEAK_PER_2Q):
         "T1": q["T1"], "T2": q["T2"],
         "p1": q["gate_1q_err"], "p2": _median_2q_err(d),
         "p_ro": q["readout_err"], "p_meas": q["gate_1q_err"],
-        # leakage is the separate per-2q-gate knob (spec 4.1); the sim charges it
-        # on each 2q gate the carried wire participates in (qsim._leak_2q).
-        "p_leak": p_leak, "p_prep": d["p_prep"],
+        # per-2q-gate leakage from the JSON (spec 4.1), global median over edges;
+        # the sim charges it on each 2q gate the carried wire touches (qsim._leak_2q).
+        "p_leak": _median_leak(d), "p_prep": d["p_prep"],
     }
 
 
@@ -158,8 +203,10 @@ if __name__ == "__main__":
     p = build_json()
     d = load(p)
     print(f"wrote {p}: {d['n_qubits']} qubits, {len(d['edges'])} edges")
-    print(f"median 2q err = {_median_2q_err(d):.4f}")
+    print(f"median 2q err = {_median_2q_err(d):.4f}, "
+          f"leak_2q_default = {d['leak_2q_default']}, "
+          f"median leak = {_median_leak(d)}")
     c = carried_calib(0)
     print("carried qubit 0 calib:")
-    for k in ("T1", "T2", "p1", "p2", "p_ro", "gate_2q", "readout", "tau"):
+    for k in ("T1", "T2", "p1", "p2", "p_ro", "gate_2q", "readout", "tau", "p_leak"):
         print(f"  {k} = {c[k]}")

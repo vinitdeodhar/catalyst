@@ -63,13 +63,71 @@ def gate_m2(C=3, S=12000, seed=9):
     return ok
 
 
+def gate_leak():
+    """Leakage-as-calibration (spec 4.1/4.2): loader validation + global-median
+    flatten + a leak_2q_default=0 regression (must reproduce zero-leak numbers)."""
+    import os
+    import tempfile
+    import ibm_dataset as ds  # sim/ on the path
+
+    ok = True
+    with tempfile.TemporaryDirectory() as td:
+        # leak_2q_default=0 -> p_leak flattens to 0 (zero-leak regression)
+        p0 = ds.build_json(os.path.join(td, "leak0.json"), leak_2q_default=0.0)
+        c0 = ds.carried_calib(0, path=p0)
+        ok_zero = c0["p_leak"] == 0.0
+        print(f"[gate leak] leak_2q_default=0 -> p_leak={c0['p_leak']}  ok={ok_zero}")
+
+        # uniform default flattens to the default (global median)
+        pd = ds.build_json(os.path.join(td, "leakd.json"), leak_2q_default=1.3e-3)
+        cd = ds.carried_calib(0, path=pd)
+        ok_dflt = abs(cd["p_leak"] - 1.3e-3) < 1e-12
+        print(f"[gate leak] uniform default -> median p_leak={cd['p_leak']}  ok={ok_dflt}")
+
+        # per-edge override respected in the global median
+        d = ds.load(pd)
+        for e in d["edges"]:
+            e["leak_2q"] = 5e-3
+        d["edges"][0].pop("leak_2q", None)  # one edge falls back to the default
+        pm = os.path.join(td, "leakm.json")
+        with open(pm, "w") as fh:
+            import json as _json
+            _json.dump(d, fh)
+        cm = ds.carried_calib(0, path=pm)
+        ok_over = abs(cm["p_leak"] - 5e-3) < 1e-12  # median of {default, 5e-3...} = 5e-3
+        print(f"[gate leak] per-edge override -> median p_leak={cm['p_leak']}  ok={ok_over}")
+
+        # missing leak_2q_default -> hard error
+        d2 = ds.load(pd)
+        d2.pop("leak_2q_default")
+        try:
+            ds._validate_leak(d2)
+            ok_missing = False
+        except ValueError:
+            ok_missing = True
+        print(f"[gate leak] missing leak_2q_default rejected  ok={ok_missing}")
+
+        # out-of-range default -> hard error
+        try:
+            ds._validate_leak({"leak_2q_default": 1.5, "edges": []})
+            ok_range = False
+        except ValueError:
+            ok_range = True
+        print(f"[gate leak] out-of-range leak_2q_default rejected  ok={ok_range}")
+
+    ok = ok_zero and ok_dflt and ok_over and ok_missing and ok_range
+    return ok
+
+
 def main():
     rng = np.random.default_rng(20260818)
     ok1 = gate_i(rng) & gate_ii(rng)
     print("MILESTONE 1:", "PASS" if ok1 else "FAIL")
     ok2 = gate_m2()
     print("MILESTONE 2:", "PASS" if ok2 else "FAIL")
-    sys.exit(0 if (ok1 and ok2) else 1)
+    ok3 = gate_leak()
+    print("LEAKAGE SCHEMA:", "PASS" if ok3 else "FAIL")
+    sys.exit(0 if (ok1 and ok2 and ok3) else 1)
 
 
 if __name__ == "__main__":

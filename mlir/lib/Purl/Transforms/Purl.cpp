@@ -67,8 +67,11 @@ struct Calib {
     double p1 = 0.0, p2 = 0.0, p_ro = 0.0, p_meas = 0.0;
     double p_leak = 0.0, p_leak_ro = 0.0, p_prep = 0.0; // non-transportable
     bool unit = true; // layer counting
+    bool ok = true;   // false => hard schema error (e.g. leakage missing)
 
-    static Calib load(StringRef spec, int qubit = 0, double pLeak = 0.0)
+    // Leakage is first-class calibration data (spec 4.1): the coupling-map schema
+    // MUST carry `leak_2q_default`; `diag` (if given) receives the hard error.
+    static Calib load(StringRef spec, int qubit = 0, Operation *diag = nullptr)
     {
         Calib c;
         if (spec == "unit" || spec.empty())
@@ -117,8 +120,30 @@ struct Calib {
                 std::sort(e2.begin(), e2.end());
                 c.p2 = e2[e2.size() / 2];
             }
-            c.p_leak = pLeak;             // separate knob (not in the dataset)
-            c.p_leak_ro = pLeak * 0.5;
+            // leakage (spec 4.1): required top-level default + optional per-edge
+            // overrides; p_leak = global median over edges (default fills gaps).
+            auto ldflt = obj->getNumber("leak_2q_default");
+            if (!ldflt) {
+                if (diag)
+                    diag->emitError("calibration JSON missing required "
+                                    "'leak_2q_default' (PURL_SPEC.md 4.1); "
+                                    "regenerate the dataset");
+                c.ok = false;
+            }
+            else {
+                SmallVector<double> lk;
+                if (auto *edges = obj->getArray("edges"))
+                    for (auto &e : *edges)
+                        if (auto *eo = e.getAsObject())
+                            lk.push_back(eo->getNumber("leak_2q").value_or(*ldflt));
+                if (!lk.empty()) {
+                    std::sort(lk.begin(), lk.end());
+                    c.p_leak = lk[lk.size() / 2];
+                }
+                else
+                    c.p_leak = *ldflt;
+                c.p_leak_ro = c.p_leak * 0.5; // derived readout leakage (spec 3.6)
+            }
         }
         else {
             // flat calibration (durations + rates)
@@ -132,7 +157,7 @@ struct Calib {
             c.p2 = get(obj, "p2", 0.0);
             c.p_ro = get(obj, "p_ro", 0.0);
             c.p_meas = get(obj, "p_meas", 0.0);
-            c.p_leak = pLeak > 0.0 ? pLeak : get(obj, "p_leak", 0.0);
+            c.p_leak = get(obj, "p_leak", 0.0);       // leakage from the JSON (spec 4.1)
             c.p_leak_ro = get(obj, "p_leak_ro", 0.0);
             c.p_prep = get(obj, "p_prep", 0.0);
         }
@@ -1179,7 +1204,11 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
     {
         MLIRContext *ctx = &getContext();
         OpBuilder b(ctx);
-        Calib c = Calib::load(calib, carryQubit, pLeak);
+        Calib c = Calib::load(calib, carryQubit, loop);
+        if (!c.ok) { // hard calibration-schema error (e.g. leakage missing)
+            signalPassFailure();
+            return;
+        }
         int n1qCarry = 0, n2qCarry = 0; // gates on the carried wire per body
 
         // nested dynamic loop guard (Part 3.2)
@@ -1329,9 +1358,9 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
             int Cb = strat != CutStrategy::None ? C
                      : tier1                 ? 1
                                              : wKnit.cMin;
-            double Fu = meanFidelity(c, B, n1qCarry, n2qCarry, pLeak, pSuccess, 0);
+            double Fu = meanFidelity(c, B, n1qCarry, n2qCarry, c.p_leak, pSuccess, 0);
             double Fb =
-                meanFidelity(c, B, n1qCarry, n2qCarry, pLeak, pSuccess, Cb);
+                meanFidelity(c, B, n1qCarry, n2qCarry, c.p_leak, pSuccess, Cb);
             loop->setAttr("purl.predicted_fidelity",
                           b.getDictionaryAttr({
                               b.getNamedAttr("unbounded", b.getF64FloatAttr(Fu)),
@@ -1341,7 +1370,7 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
                 loop->setAttr(
                     "purl.fidelity_at_depth",
                     b.getF64FloatAttr(predictFidelity((double)depth, c, B,
-                                                      n1qCarry, n2qCarry, pLeak)));
+                                                      n1qCarry, n2qCarry, c.p_leak)));
         }
 
         if (analyzeOnly)

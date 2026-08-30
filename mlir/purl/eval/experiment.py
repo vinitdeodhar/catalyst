@@ -110,10 +110,16 @@ def main():
                     help="run on real IBM Eagle r3 per-qubit hardware data")
     ap.add_argument("--carry-qubit", type=int, default=0,
                     help="physical qubit index for the carried wire (--ibm)")
-    ap.add_argument("--leak", type=float, default=None,
-                    help="per-2q-gate leakage prob on the carried qubit "
-                         "(--ibm; default = published IBM estimate)")
+    ap.add_argument("--ibm-json", default=None,
+                    help="path to the calibration JSON (--ibm; default the bundled "
+                         "ibm_eagle_r3.json; use eval/variants.py for leakage sweeps)")
+    ap.add_argument("--leak", type=float, default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.leak is not None:
+        ap.error("--leak was removed: leakage is now calibration data, the "
+                 "'leak_2q_default' key in the JSON (PURL_SPEC.md 4.1). Sweep it "
+                 "with eval/variants.py (generates variant JSONs), not a CLI knob.")
 
     if args.bench == "rus_lowp":
         import benchmarks.rus_lowp as bench
@@ -131,13 +137,14 @@ def main():
     prep = getattr(bench, "prep_fast", _prep_psi0)
 
     if args.ibm:
-        # real IBM Eagle r3 data for the carried qubit; leakage is the separate
-        # published per-2q-gate estimate (spec 4.1), charged by qsim on each 2q gate.
-        from sim.ibm_dataset import carried_calib, IBM_LEAK_PER_2Q
+        # real IBM Eagle r3 data for the carried qubit; leakage is read from the
+        # JSON (spec 4.1, 'leak_2q_default'), charged by qsim on each 2q gate.
+        from sim.ibm_dataset import carried_calib, JSON_PATH
         from sim.qsim import load_calib
-        leak = args.leak if args.leak is not None else IBM_LEAK_PER_2Q
-        calib = load_calib(carried_calib(args.carry_qubit, p_leak=leak))
-        src = f"IBM Eagle r3 (qubit {args.carry_qubit}, p_leak/2q={leak:g})"
+        path = args.ibm_json or JSON_PATH
+        cc = carried_calib(args.carry_qubit, path=path)
+        calib = load_calib(cc)
+        src = f"IBM Eagle r3 (qubit {args.carry_qubit}, p_leak/2q={cc['p_leak']:g})"
     else:
         good = args.bench in ("rus_lowp", "ipe")
         calib = dict(GOOD_MEM) if good else dict(EVAL_CALIB)

@@ -56,8 +56,6 @@ def PurlPass : Pass<"purl"> {
             "Per-shot standard deviation of the observable (profile input).">,
         Option<"carryQubit", "carry-qubit", "int", /*default=*/"0",
             "Physical qubit index the carried wire maps to (placement input).">,
-        Option<"pLeak", "p-leak", "double", /*default=*/"0.0",
-            "Per-2q-gate leakage probability on the carried wire (hardware knob).">,
         Option<"depth", "depth", "int", /*default=*/"0",
             "Report purl.fidelity_at_depth at this runtime depth D in iterations (0 = off).">
     ];
