@@ -119,6 +119,107 @@ def gate_leak():
     return ok
 
 
+def gate_pump():
+    """pump benchmark (spec 6.1): at lam=0 the mirror delivers <Z>=0.5 (the
+    CNOT-S-CNOT sandwich is net-identity on the held wire); the per-iteration 2q
+    count matches n2q=6 (parity with the pass); fixed seeds are byte-reproducible."""
+    import benchmarks.pump as pump
+
+    # lam=0: identity body -> <Z> = Z_IDEAL within statistics
+    zs = []
+    rng = np.random.default_rng(4242)
+    N = 6000
+    for _ in range(N):
+        _, z = pump.run_unbounded(rng, lam=0.0)
+        zs.append(z)
+    mu = float(np.mean(zs))
+    se = float(np.std(zs, ddof=1) / math.sqrt(N))
+    ok_z = abs(mu - pump.Z_IDEAL) <= 3 * se
+    print(f"[gate pump] lam=0 <Z>={mu:+.4f} (ideal {pump.Z_IDEAL}, 3se={3*se:.3f})  "
+          f"ok={ok_z}")
+
+    # n2q parity: the mirror charges exactly 6 two-qubit gates per iteration.
+    calls = {"n": 0}
+    sim = QSim(pump.N_WIRES, lam=1.0, rng=np.random.default_rng(1))
+    orig = sim.cnot
+    sim.cnot = lambda c, t: (calls.__setitem__("n", calls["n"] + 1), orig(c, t))[1]
+    pump.prepare_input(sim)
+    pump.attempt(sim)
+    ok_n2q = calls["n"] == pump.N2Q_PER_ITER == 6
+    print(f"[gate pump] per-iteration 2q gates={calls['n']} (n2q={pump.N2Q_PER_ITER})"
+          f"  ok={ok_n2q}")
+
+    # determinism: same seed -> identical trajectory
+    a = [pump.run_unbounded(np.random.default_rng(7), lam=1.0) for _ in range(3)]
+    b = [pump.run_unbounded(np.random.default_rng(7), lam=1.0) for _ in range(3)]
+    ok_det = a == b
+    print(f"[gate pump] fixed-seed determinism  ok={ok_det}")
+
+    return ok_z and ok_n2q and ok_det
+
+
+def gate_ipe_project():
+    """ipe_project (spec 6.3): the knit-only projection benchmark. Checks the
+    per-shot-reference machinery and the pass-relevant window math -- (a) lam=0
+    delivered fidelity -> 1 for the confident config, (b) the posterior winner
+    matches the collapsed data eigenstate on every noiseless shot, (c) the knit
+    estimator is unbiased at lam=0, (d) an invalid forced refresh collapses the
+    fidelity, and (e) the knit window is empty (faithful) / non-empty (fast)."""
+    import benchmarks.ipe_project as ip
+    from eval.run_eval import window
+    from sim.ibm_dataset import carried_calib
+    from sim.qsim import load_calib
+
+    # (a) lam=0 confident projection -> F near 1 (F = posterior confidence -> 1).
+    rng = np.random.default_rng(31)
+    shots = [ip.run(rng, ip.FAITHFUL, lam=0.0)[1:] for _ in range(3000)]
+    F0 = ip.delivered_fidelity([(w, z, 1.0) for w, z, _ in shots])
+    ok_f0 = F0 >= 0.99
+    print(f"[gate ipe_project] lam=0 faithful delivered F={F0:.4f} (>=0.99)  ok={ok_f0}")
+
+    # (b) posterior winner == collapsed data eigenstate on every noiseless shot.
+    rng = np.random.default_rng(32)
+    mism = 0
+    N = 2000
+    for _ in range(N):
+        wn, p1 = ip.run_debug(rng, ip.FAITHFUL, lam=0.0)
+        if (1 if p1 > 0.5 else 0) != wn:
+            mism += 1
+    ok_match = mism == 0
+    print(f"[gate ipe_project] winner==collapsed eigenstate mismatches={mism}/{N}  "
+          f"ok={ok_match}")
+
+    # (c) knit estimator unbiased at lam=0 (fast, C=6 in-window): F_knit ~ F_unb.
+    rng = np.random.default_rng(33)
+    ub = [ip.run(rng, ip.FAST, lam=0.0, max_rounds=10)[1:] for _ in range(6000)]
+    kn = [ip.run(rng, ip.FAST, lam=0.0, C=6, max_rounds=10) for _ in range(6000)]
+    Fu = ip.delivered_fidelity([(w, z, 1.0) for w, z, _ in ub])
+    Fk = ip.delivered_fidelity([(w, z, wt) for _, w, z, wt in kn])
+    ok_knit = abs(Fu - Fk) < 0.08
+    print(f"[gate ipe_project] knit unbiased lam=0 F_unb={Fu:.3f} F_knit={Fk:.3f} "
+          f"|diff|={abs(Fu-Fk):.3f} (<0.08)  ok={ok_knit}")
+
+    # (d) forced refresh (INVALID here) collapses the delivered fidelity.
+    rng = np.random.default_rng(34)
+    val = [ip.run(rng, ip.FAITHFUL, lam=1.0)[1:] for _ in range(3000)]
+    fr = [ip.run_forced_refresh(rng, ip.FAITHFUL, lam=1.0, C=2)[1:] for _ in range(3000)]
+    Fv = ip.delivered_fidelity([(w, z, 1.0) for w, z, _ in val])
+    Ff = ip.delivered_fidelity([(w, z, 1.0) for w, z, _ in fr])
+    ok_fals = Ff < Fv - 0.08
+    print(f"[gate ipe_project] falsification F_valid={Fv:.3f} -> F_forced_refresh="
+          f"{Ff:.3f} (collapse)  ok={ok_fals}")
+
+    # (e) window math on the IBM calib: faithful empty, fast non-empty.
+    cal = load_calib(carried_calib(0))
+    wf = window(ip.FAITHFUL.p_nominal, f=ip.FAITHFUL.f, calib=cal)
+    ws = window(ip.FAST.p_nominal, f=ip.FAST.f, calib=cal)
+    ok_win = wf[0] > wf[1] and ws[0] <= ws[1]
+    print(f"[gate ipe_project] window faithful={wf} (empty) fast={ws} (non-empty)  "
+          f"ok={ok_win}")
+
+    return ok_f0 and ok_match and ok_knit and ok_fals and ok_win
+
+
 def main():
     rng = np.random.default_rng(20260818)
     ok1 = gate_i(rng) & gate_ii(rng)
@@ -127,7 +228,11 @@ def main():
     print("MILESTONE 2:", "PASS" if ok2 else "FAIL")
     ok3 = gate_leak()
     print("LEAKAGE SCHEMA:", "PASS" if ok3 else "FAIL")
-    sys.exit(0 if (ok1 and ok2 and ok3) else 1)
+    ok4 = gate_pump()
+    print("PUMP BENCHMARK:", "PASS" if ok4 else "FAIL")
+    ok5 = gate_ipe_project()
+    print("IPE_PROJECT BENCHMARK:", "PASS" if ok5 else "FAIL")
+    sys.exit(0 if (ok1 and ok2 and ok3 and ok4 and ok5) else 1)
 
 
 if __name__ == "__main__":

@@ -55,6 +55,19 @@ S = np.array([[1, 0], [0, 1j]], dtype=complex)
 SDG = np.array([[1, 0], [0, -1j]], dtype=complex)
 T = np.array([[1, 0], [0, cmath.exp(1j * math.pi / 4)]], dtype=complex)
 
+
+def RY(angle):
+    """Y-rotation Ry(a) = [[cos, -sin], [sin, cos]] (half-angle)."""
+    c, s = math.cos(angle / 2.0), math.sin(angle / 2.0)
+    return np.array([[c, -s], [s, c]], dtype=complex)
+
+
+def RZ(phi):
+    """Z-rotation Rz(phi) = diag(e^{-i phi/2}, e^{+i phi/2}) -- U of ipe_project."""
+    return np.array([[cmath.exp(-0.5j * phi), 0], [0, cmath.exp(0.5j * phi)]],
+                    dtype=complex)
+
+
 _PAULIS_1Q = [X, Y, Z]  # non-identity single-qubit Paulis (depolarizing draws)
 
 
@@ -292,6 +305,20 @@ class QSim:
 
     def t(self, q):
         self._gate1(T, q)
+
+    def ry(self, q, angle):
+        """Arbitrary Y-rotation (non-Clifford): prepares eigenstate superpositions
+        (e.g. ipe_project's cos(a)|0>+sin(a)|1> = Ry(2a)|0>)."""
+        self._gate1(RY(angle), q)
+
+    def crz(self, c, tq, phi):
+        """Controlled-Rz(phi): ipe_project's controlled-U^m phase kickback (spec
+        6.3). Non-Clifford, so the known-state proof returns unknown. Charges one
+        2q gate's idle/depolarizing/leakage on both wires, like cnot."""
+        self._idle_others([c, tq], self.calib["gate_2q"])
+        self._apply_ctrl(RZ(phi), [c], tq)
+        self._depol_nq([c, tq])
+        self._leak_2q([c, tq])
 
     def cnot(self, c, tq):
         self._idle_others([c, tq], self.calib["gate_2q"])
