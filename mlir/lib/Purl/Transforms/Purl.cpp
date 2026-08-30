@@ -879,7 +879,7 @@ static void countCarriedGates(Value carriedArg, int &n1q, int &n2q)
 // Idle decay uses exp(-t/T2) ONLY -- 1/T2 already contains 1/(2 T1), so a separate
 // exp(-t/T1) factor would double-count (spec 3.6 / 4.2 enforces T2 <= 2 T1).
 static double predictFidelity(double D, const Calib &c, double Bsec, int n1q,
-                              int n2q, double pLeak)
+                              int n2q)
 {
     double tidle = D * (Bsec + c.tau);
     double F = 1.0;
@@ -887,7 +887,7 @@ static double predictFidelity(double D, const Calib &c, double Bsec, int n1q,
         F *= std::exp(-tidle / c.T2); // coherence loss over the held DURATION
     F *= std::pow(1.0 - c.p1, D * n1q); // gate + leakage error over the held gate COUNT
     F *= std::pow(1.0 - c.p2, D * n2q);
-    F *= std::pow(1.0 - pLeak, D * n2q);
+    F *= std::pow(1.0 - c.p_leak, D * n2q); // leakage per 2q gate (spec 4.1)
     return F;
 }
 
@@ -895,13 +895,13 @@ static double predictFidelity(double D, const Calib &c, double Bsec, int n1q,
 // delivered coherent depth is k iterations. Bounded/refresh at C: the delivered
 // coherent depth is ((k-1) mod C) + 1 (reset every C).
 static double meanFidelity(const Calib &c, double Bsec, int n1q, int n2q,
-                           double pLeak, double p, int C /* 0 = unbounded */)
+                           double p, int C /* 0 = unbounded */)
 {
     double s = 0.0, w;
     for (int k = 1; k <= 200000; ++k) {
         w = p * std::pow(1.0 - p, k - 1);
         int age = C > 0 ? ((k - 1) % C) + 1 : k;
-        s += w * predictFidelity((double)age, c, Bsec, n1q, n2q, pLeak);
+        s += w * predictFidelity((double)age, c, Bsec, n1q, n2q);
         if (w < 1e-14 && k > 8)
             break;
     }
@@ -1358,9 +1358,8 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
             int Cb = strat != CutStrategy::None ? C
                      : tier1                 ? 1
                                              : wKnit.cMin;
-            double Fu = meanFidelity(c, B, n1qCarry, n2qCarry, c.p_leak, pSuccess, 0);
-            double Fb =
-                meanFidelity(c, B, n1qCarry, n2qCarry, c.p_leak, pSuccess, Cb);
+            double Fu = meanFidelity(c, B, n1qCarry, n2qCarry, pSuccess, 0);
+            double Fb = meanFidelity(c, B, n1qCarry, n2qCarry, pSuccess, Cb);
             loop->setAttr("purl.predicted_fidelity",
                           b.getDictionaryAttr({
                               b.getNamedAttr("unbounded", b.getF64FloatAttr(Fu)),
@@ -1370,7 +1369,7 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
                 loop->setAttr(
                     "purl.fidelity_at_depth",
                     b.getF64FloatAttr(predictFidelity((double)depth, c, B,
-                                                      n1qCarry, n2qCarry, c.p_leak)));
+                                                      n1qCarry, n2qCarry)));
         }
 
         if (analyzeOnly)
