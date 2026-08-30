@@ -720,7 +720,7 @@ Each benchmark exists as (a) a **PennyLane/Catalyst `@qjit` program** using
 `catalyst.while_loop` + mid-circuit `measure`, which **lowers to MLIR** (captured
 via `keep_intermediate` / `catalyst-cli`) and is the input the Purl pass is
 applied to; and (b) a **Python mirror** driving the §5 simulator, kept in lockstep
-for the fidelity study. All three are carry-type, hold the non-Clifford magic
+for the fidelity study. All are carry-type, hold the non-Clifford magic
 state `|psi0> = H T H T H |0>`, and return `qml.expval(PauliZ(target))`.
 
 | Name | p | coin gate set | Role |
@@ -728,9 +728,11 @@ state `|psi0> = H T H T H |0>`, and return `qml.expval(PauliZ(target))`.
 | `rus_rx_ibm` | 5/8 | Toffoli-sandwich (multi-control, **non-Clifford**) | primary; IBM-tutorial RUS shape (2 controls + 1 held target) |
 | `rus_chain(N)` | 5/8 / stage | Toffoli per stage | N sequential RUS gates on one held data qubit (N ∈ {1,2,4,8}) |
 | `rus_lowp` | 0.1 | **CNOT-heralded** (Clifford + CNOT ancilla; identity on the target on failure) | low-p heavy-tail regime (quantum-repeater / heralded memory); mean trip count 10 — where cutting is meant to help |
+| `pump` | 0.1 | **CNOT-sandwich ×3** (Clifford; identity on the held data each iteration; **6 two-qubit gates/iter**) | entanglement-pumping proxy (§6.1); leakage-heavy carry — the primary consumer of the per-2q leakage model (§4.1) |
 
-The three hold the same input state and identical carried-qubit *physics*; they
-differ in the trip distribution (`p`), stage count (`N`), and — deliberately — the
+These hold the same input state and identical carried-qubit *physics*; they
+differ in the trip distribution (`p`), stage count (`N`), the 2q-gate load per
+iteration, and — deliberately — the
 **coin gate set**, which decides provability (§3.4). `rus_lowp` uses a CNOT-based
 heralding coin whose net action on the held target is provably **identity** on
 failure, so REFRESH fires; the Toffoli-based coins are non-Clifford multi-control,
@@ -741,6 +743,89 @@ which §3.4 cannot prove, so they fall back to KNIT/NONE. Expected pass outcomes
 | `rus_rx_ibm` | carry | unknown | **none** (thin p=5/8 tail, §11; knit only if its window is non-empty and profitable) |
 | `rus_chain(N)` | carry | unknown | none / knit per stage |
 | `rus_lowp` | carry | identity | **refresh** — the headline positive result (§11, S2) |
+| `pump` | carry | identity | **refresh** (window `[1,2]`; leakage-clearing gain, §6.1) |
+
+### 6.1 `pump` — entanglement-pumping proxy
+
+**What it models.** Entanglement pumping repeatedly attempts a purification round
+against one held quantum resource until a herald succeeds, so the held resource
+ages through a *geometric* number of two-qubit-gate-heavy rounds — exactly Purl's
+carry shape. Two properties the other benchmarks lack: (a) each iteration charges
+**many** 2q gates to the held wire, so **leakage** (charged per 2q gate, §4.1)
+becomes a first-order term rather than a sliver — `pump` is the primary consumer of
+the per-gate leakage model; and (b) the protocol family is *canonical* (a named,
+citable purification/pumping lineage, §6.2) rather than constructed. The held wire
+is a **single-qubit proxy** for the true two-qubit resource — the same
+simplification `rus` already uses, and it must be described as such in the paper.
+
+**Definition.** Two lockstep artifacts (a `@qjit` program lowered to MLIR + a Python
+mirror). *Held wire `d`*: prepared once, before the loop, in
+`|psi0> = H T H T H |0>` (identical to `rus`, ideal `<Z>=0.5`); never measured in
+the loop. *Ancilla `a`*: reset and reused every iteration (fixed register, no
+per-iteration allocation). Body, per iteration:
+1. **Coin.** Reset `a`, then `Ry(theta)` on `a`, with `theta` chosen so the success
+   probability is exactly `p = 0.1` (mean 10 trips, matching `rus_lowp` for
+   comparability).
+2. **Entangling block ×3** (6 two-qubit gates/iteration): `CNOT(a→d)`, `S(a)`,
+   `CNOT(a→d)`. The sandwich decouples exactly — on the `a=|0>` branch the data wire
+   is untouched, and on the `a=|1>` branch the second CNOT undoes the first kick — so
+   the net action on `d` is the **identity** and the measurement outcome is provably
+   independent of the data state. All gates are Clifford, so §3.4 certifies identity.
+3. **Measure `a`.** Success exits the loop, failure repeats.
+
+Output `qml.expval(PauliZ(d))`. Target body depth `B ≈ 12` gate layers (the 6 2q
+gates dominate); **report the exact computed `B` in the results, do not force it**.
+
+**Expected pass behavior (assert, do not assume).** `purl.class = carry` (single
+carry slot); `purl.known_state = identity` — the Clifford sandwich is the point, so
+an `unknown` result means the analysis has a bug or the benchmark deviated from the
+definition above; **refresh** with window `[1, C_max]`, and with `B≈12` expect
+`C_max = C = 2` as in `rus_lowp`; KNIT stays inadmissible at `p=0.1` (variance floor
+near 29).
+
+**Evaluation.** Standard configuration (§8.3: 6000 shots, 8 seeds,
+`lam∈{0,0.25,0.5,1,2,4}`), arms **unbounded** and **refresh**, delivered fidelity by
+3-basis tomography against `|psi0>`, plus the RMSE/depth columns as for the other
+benchmarks. Two runs beyond the standard sweep:
+1. **Zero-leakage ablation** — an identical run with leakage set to zero (variant
+   JSON, §4.1). The gap between the refresh gains of the two runs is the **measured
+   leakage-clearing component**, reported explicitly.
+2. **Leakage sweep** — leakage ∈ {1e-4, 1e-3, 1e-2} via variant calibration files
+   (`eval/variants.py`, §5.1), reporting refresh gain and predicted↔measured
+   agreement at each point.
+
+**Acceptance.** (1) The expected-behavior assertions hold on the **real lowered IR**.
+(2) Refresh gain at nominal noise **exceeds the `rus` gain** (the leakage-heavy coin
+should decohere the unbounded arm faster) — report the number, whatever it is. (3)
+The ablation cleanly separates age-capping from leakage-clearing, and
+predicted↔measured stays within the **S3 0.02 criterion** at nominal noise across the
+leakage sweep.
+
+**Out of scope.** Two-qubit held states (true pairs), seepage, per-edge leakage
+placement studies, and any change to the coin's success-probability model.
+
+### 6.2 `pump` citations (verify before use)
+
+For the paper's benchmark description. Best-effort; **verify every entry against the
+published record before adding to the bibliography** — author lists and page numbers
+must be checked, and DOIs omitted rather than guessed.
+
+- Bennett, Brassard, Popescu, Schumacher, Smolin, Wootters. *Purification of Noisy
+  Entanglement and Faithful Teleportation via Noisy Channels.* Phys. Rev. Lett.
+  **76**, 722 (1996). — origin of entanglement purification.
+- Deutsch, Ekert, Jozsa, Macchiavello, Popescu, Sanpera. *Quantum Privacy
+  Amplification and the Security of Quantum Cryptography over Noisy Channels.* Phys.
+  Rev. Lett. **77**, 2818 (1996). — the standard two-way purification protocol.
+- Dür, Briegel, Cirac, Zoller. *Quantum repeaters based on entanglement
+  purification.* Phys. Rev. A **59**, 169 (1999). — entanglement *pumping*
+  specifically: the repeated-attempt loop against one held pair this benchmark
+  proxies.
+- Briegel, Dür, Cirac, Zoller. *Quantum Repeaters: The Role of Imperfect Local
+  Operations in Quantum Communication.* Phys. Rev. Lett. **81**, 5932 (1998). —
+  already in the paper's bibliography as `briegel1998repeaters`; **reuse the key**.
+- Kalb, Reiserer, Humphreys, et al. *Entanglement distillation between solid-state
+  quantum network nodes.* Science **356**, 928 (2017). — experimental demonstration
+  that held-resource purification loops are real practice, not theory alone.
 
 ---
 
@@ -755,9 +840,16 @@ Under `mlir/test/Quantum/Purl/`, run by lit / `check-dialects`:
   `known_state_unprovable` (→ knit fallback) — the proof + refresh rewrite.
 - `tier1_detect` / `profit_none` / `tier3_unknown` — the 3.5 strategy selection.
 - `ibm_fidelity` — the per-qubit dataset drives `purl.predicted_fidelity`.
+- `pump_refresh` (§6.1) — the 3-block CNOT-sandwich body classifies **carry**,
+  proves **identity**, and receives the **refresh** rewrite.
 
 Each asserts the relevant `purl.*` attributes and, for rewrites, the transformed
 structure (carry extension, guard, cut expansion / reset+re-prep, output).
+
+Simulator/model gates for `pump` (in the §5 validation harness, not FileCheck): at
+`lam=0` the mirror reproduces `<Z>=0.5` exactly; the pass's per-iteration `n2q = 6`
+matches the mirror's leakage charging (a one-iteration parity check); fixed seeds
+reproduce the run byte-for-byte.
 
 ---
 
