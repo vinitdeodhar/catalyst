@@ -729,8 +729,9 @@ state `|psi0> = H T H T H |0>`, and return `qml.expval(PauliZ(target))`.
 | `rus_chain(N)` | 5/8 / stage | Toffoli per stage | N sequential RUS gates on one held data qubit (N ∈ {1,2,4,8}) |
 | `rus_lowp` | 0.1 | **CNOT-heralded** (Clifford + CNOT ancilla; identity on the target on failure) | low-p heavy-tail regime (quantum-repeater / heralded memory); mean trip count 10 — where cutting is meant to help |
 | `pump` | 0.1 | **CNOT-sandwich ×3** (Clifford; identity on the held data each iteration; **6 two-qubit gates/iter**) | entanglement-pumping proxy (§6.1); leakage-heavy carry — the primary consumer of the per-2q leakage model (§4.1) |
+| `ipe_project` | ~0.12 / ~0.45 | **controlled-Rz(θ)** (non-Clifford; each round partially projects the carried superposition — the carried state is **outcome-dependent**) | phase-estimation-as-projection (§6.3); the **knit-only** benchmark (refresh is *unsound in principle*), with a refresh falsification arm |
 
-These hold the same input state and identical carried-qubit *physics*; they
+Most hold the same magic-state input and identical carried-qubit *physics*; they
 differ in the trip distribution (`p`), stage count (`N`), the 2q-gate load per
 iteration, and — deliberately — the
 **coin gate set**, which decides provability (§3.4). `rus_lowp` uses a CNOT-based
@@ -744,6 +745,8 @@ which §3.4 cannot prove, so they fall back to KNIT/NONE. Expected pass outcomes
 | `rus_chain(N)` | carry | unknown | none / knit per stage |
 | `rus_lowp` | carry | identity | **refresh** — the headline positive result (§11, S2) |
 | `pump` | carry | identity | **refresh** (window `[1,2]`; leakage-clearing gain, §6.1) |
+| `ipe_project` (faithful) | carry | unknown | **none** (knit window empty, `C_min≈24 > C_max`; §6.3) |
+| `ipe_project_fast` | carry | unknown | **knit** — the knit-arm positive result (non-empty window at p≈0.45, B≈4, f=0.15; §6.3) |
 
 ### 6.1 `pump` — entanglement-pumping proxy
 
@@ -827,6 +830,104 @@ must be checked, and DOIs omitted rather than guessed.
   quantum network nodes.* Science **356**, 928 (2017). — experimental demonstration
   that held-resource purification loops are real practice, not theory alone.
 
+### 6.3 `ipe_project` — phase estimation as eigenstate projection
+
+**What it models & why (spec role).** `ipe_project` is the benchmark where
+**refresh is unsound in principle and knit is the only valid cut** — the complement
+of the identity/refresh benchmarks. The existing `ipe` holds a *known* eigenstate
+(provable → refresh fires). Here the carried wire starts in a **superposition of
+eigenstates**, and each round's ancilla measurement partially **projects** it toward
+one eigenstate, so the carried state at any iteration boundary depends on the
+**outcome history**. There is no fixed state to re-prepare, and re-preparing anything
+would erase the projection progress that *is* the computation. This gives the paper
+three things: a **knit** result on a real, citable protocol (not a synthetic loop);
+a demonstration that the known-state analysis returning `unknown` is sometimes the
+*physically correct* answer, not a limitation; and a **falsification arm** showing
+refresh actively destroying a computation it is not entitled to touch. It replaces
+the dropped Toffoli negative control with a physically motivated one. It reuses the
+`ipe` program shape, mirror, and adaptive stop (§6, ipe row).
+
+**Definition.** Carried wire `d` prepared in `cos(α)|+> + sin(α)|->` with `α = π/8`
+(well away from an eigenstate), where `|+>,|->` are the eigenstates of
+`U = Rz(θ)` for a fixed non-Clifford `θ = 2π/7` (no special structure); `d` is never
+measured in the loop. Body per round (the `ipe` structure): reset ancilla, Hadamard,
+**controlled-`U^(2^j)`** on the exponent schedule, Hadamard, measure the ancilla,
+update the classical posterior, and continue until the posterior is confident. The
+controlled rotation is **non-Clifford**, so §3.4 must return `unknown` (assert it).
+Output: the expectation of the eigenstate observable on `d` (per-shot reference,
+below).
+
+**Two configurations, both reported.**
+- **`ipe_project` (faithful)** — stop probability near the existing `ipe` value
+  (`p≈0.12`). Expected: `class=carry`, `known_state=unknown`, knit window **empty**
+  (`C_min≈24 > C_max`), `strategy=none`. The paper's negative control.
+- **`ipe_project_fast` (knit-live)** — a coarser confidence threshold giving
+  `p≈0.45`, body trimmed toward `B≈4` layers, coherence-budget fraction `f=0.15`
+  (a legitimate compiler knob, reported as such). **Build-time check:** verify
+  `C_min ≤ C_max` on the deployed calibration; raise `f` before touching `p`.
+  Expected: `strategy=knit` at the cost model's arg-min period (§3.5). Also run with
+  the **elevated-leakage variant** (`leak_2q_default = 1e-2`, §4.1) so the
+  knit-cleared leakage is measurable.
+
+**Expected pass behavior (assert, do not assume).** `class=carry`,
+`known_state=unknown` in **both** configs. Faithful: knit inadmissible, loop left
+unchanged, decision attributes still emitted for audit. Fast: `strategy=knit`, the
+expval legalized to the weighted sample, the quasi-probability weight threaded
+through the carry, counter reset + weight accumulation per the existing knit rewrite.
+
+**Delivered-fidelity metric (the subtle point).** The ideal delivered state is
+**trajectory-dependent**, so the tomography reference is chosen **per shot**: the
+eigenstate identified by that shot's own classical record (the posterior's winner at
+exit). At `lam=0` this reference is exact and delivered fidelity must be **1.0**
+within statistics (validation gate). Conditioning on the record is legitimate (the
+record is part of each shot's data); for the **knit** arm the quasi-probability
+weight multiplies the *conditioned* estimate — keep the weight attached to the shot
+through the conditioning, and clamp the reconstructed Bloch vector as the existing
+knit tomography does (§5.1). This estimator must be documented in code comments; it
+is the part a reviewer will check.
+
+**Evaluation.** Standard sweep (§8.3: 6000 shots, 8 seeds, the usual `lam` grid) on
+both configs, arms **unbounded** and **knit** (refresh is not applicable). Report the
+usual fidelity/RMSE/depth columns, plus predicted↔measured for the fast config at
+nominal noise. **Falsification arm** (run once at `lam=1` on the faithful config):
+FORCE a refresh-style cut that re-prepares the initial superposition every `C`
+iterations. Expected: delivered fidelity against the per-shot reference **collapses**
+toward the input state's overlap with the winning eigenstate — concretely showing
+refresh on an `unknown` carried state changes the computation. Label it clearly as a
+**deliberately invalid** transformation run for illustration.
+
+**Acceptance.** (1) The expected-behavior assertions hold on the **real lowered IR**
+for both configs. (2) Fast config: knit fires, and with the elevated-leakage variant
+its measured gain over unbounded is **positive with non-overlapping seed error
+bars**, while near-zero leakage makes the gain statistically indistinguishable from
+zero (the no-go, observed). (3) predicted↔measured within the **S3 0.02 criterion**
+at nominal noise for the fast config's selected strategy. (4) The falsification arm
+reproduces the expected fidelity collapse.
+
+**Out of scope.** Multi-qubit `U`, mid-loop posterior resets, seepage, any change to
+the knit lowering or the `γ=4` decomposition.
+
+### 6.4 `ipe_project` citations (verify before use)
+
+Best-effort; **verify every entry against the published record before adding to the
+bibliography**, and omit DOIs rather than guess.
+
+- Abrams, Lloyd. *Quantum Algorithm Providing Exponential Speed Increase for Finding
+  Eigenvalues and Eigenvectors.* Phys. Rev. Lett. **83**, 5162 (1999). — phase
+  estimation as projection of an approximate input onto exact eigenstates (the exact
+  structure this benchmark runs).
+- Kitaev. *Quantum measurements and the Abelian Stabilizer Problem.*
+  arXiv:quant-ph/9511026 (1995). — origin of phase estimation.
+- Dobšíček, Johansson, Shumeiko, Wendin. *Arbitrary accuracy iterative quantum phase
+  estimation algorithm using a single ancilla qubit.* Phys. Rev. A **76**, 030306
+  (2007). — the single-ancilla iterative mechanics the loop body uses.
+- Wiebe, Granade. *Efficient Bayesian Phase Estimation.* Phys. Rev. Lett. **117**,
+  010503 (2016). — adaptive, posterior-conditioned stopping (the loop's termination
+  rule).
+- O'Brien, Tarasinski, Terhal. *Quantum phase estimation of multiple eigenvalues for
+  small-scale (noisy) experiments.* New J. Phys. **21**, 023022 (2019). — IPE under
+  realistic noise (practice anchor).
+
 ---
 
 ## 7. Unit tests (FileCheck / lit)
@@ -842,9 +943,20 @@ Under `mlir/test/Quantum/Purl/`, run by lit / `check-dialects`:
 - `ibm_fidelity` — the per-qubit dataset drives `purl.predicted_fidelity`.
 - `pump_refresh` (§6.1) — the 3-block CNOT-sandwich body classifies **carry**,
   proves **identity**, and receives the **refresh** rewrite.
+- `ipe_project_unknown` (§6.3) — the controlled-`Rz` body classifies **carry** and
+  returns **`unknown`**; **no refresh rewrite** occurs.
+- `ipe_project_knit` (§6.3) — the fast-config shape receives the **knit** rewrite
+  (guard, weight carry, `purl.qcut` with axis, expval legalization).
 
 Each asserts the relevant `purl.*` attributes and, for rewrites, the transformed
 structure (carry extension, guard, cut expansion / reset+re-prep, output).
+
+Simulator/model gates for `ipe_project` (§5 validation harness, not FileCheck): at
+`lam=0` the projection fidelity against the **per-shot reference** (the posterior
+winner's eigenstate) is **1.0** within statistics and the posterior winner matches
+the collapsed eigenstate on every noiseless shot; a window-math unit test pins
+`C_min`/`C_max` for both configs on the deployed calibration (empty for faithful,
+non-empty for fast).
 
 Simulator/model gates for `pump` (in the §5 validation harness, not FileCheck): at
 `lam=0` the mirror reproduces `<Z>=0.5` exactly; the pass's per-iteration `n2q = 6`
