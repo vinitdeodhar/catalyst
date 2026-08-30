@@ -1,7 +1,7 @@
-benchmark,lam,p,C_knit,C_refresh,B_layers,depth_per_iter,min_number_of_iterations,mean_number_of_iterations,max_number_of_iterations,runtime_depth,fidelity_unbounded,fidelity_knit,fidelity_refresh,std_knit,std_refresh,knit_admissible
-rus_rx_ibm,0.0,0.625,,2,12,12,1,1.604,10,19.2,0.9935,,0.9893,,0.0196,0
-rus_rx_ibm,0.25,0.625,,2,12,12,1,1.589,11,19.1,0.9928,,0.977,,0.0079,0
-rus_rx_ibm,0.5,0.625,,2,12,12,1,1.588,11,19.1,0.9903,,0.9718,,0.0079,0
-rus_rx_ibm,1.0,0.625,,2,12,12,1,1.593,10,19.1,0.9707,,0.9545,,0.0127,0
-rus_rx_ibm,2.0,0.625,,2,12,12,1,1.593,10,19.1,0.9482,,0.9416,,0.0241,0
-rus_rx_ibm,4.0,0.625,,2,12,12,1,1.585,10,19.0,0.9127,,0.8985,,0.0207,0
+benchmark,lam,p,C_knit,C_refresh,B_layers,depth_per_iter,min_iters,mean_iters,max_iters,runtime_depth,bounded_cap_layers,fidelity_unbounded,fidelity_knit,fidelity_refresh,std_knit,std_refresh,knit_admissible,rmse_unbounded,rmse_refresh,delta_rmse_ref_minus_unb,best_arm
+rus_rx_ibm,0.0,0.625,,2,12,12,1,1.594,10,19.1,24,0.9936,,0.9971,,0.0116,0,0.0102,0.012,0.0018,unbounded
+rus_rx_ibm,0.25,0.625,,2,12,12,1,1.597,13,19.2,24,0.9941,,0.9931,,0.0091,0,0.0112,0.0114,0.0003,unbounded
+rus_rx_ibm,0.5,0.625,,2,12,12,1,1.597,13,19.2,24,0.9897,,0.9882,,0.0082,0,0.0139,0.0144,0.0005,unbounded
+rus_rx_ibm,1.0,0.625,,2,12,12,1,1.598,13,19.2,24,0.9775,,0.9793,,0.008,0,0.0242,0.0222,-0.0021,refresh
+rus_rx_ibm,2.0,0.625,,2,12,12,1,1.599,11,19.2,24,0.9569,,0.9593,,0.007,0,0.0444,0.0413,-0.0031,refresh
+rus_rx_ibm,4.0,0.625,,2,12,12,1,1.595,11,19.1,24,0.9149,,0.9171,,0.0062,0,0.0856,0.0831,-0.0025,refresh
