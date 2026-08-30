@@ -38,19 +38,21 @@ def _draw_k(rng, p=P, max_trips=2000):
 
 def _hold(sim, dt, touch):
     """One held iteration on the carried target: idle decay, plus (for a
-    target-entangling benchmark, spec 5.1) a net-identity 2q touch that charges
-    per-2q-gate leakage. `touch=False` is the idle-only held memory (rus_rx_ibm)."""
+    target-entangling benchmark, spec 5.1) `touch` net-identity 2q touches that
+    each charge per-2q-gate leakage + depolarizing. `touch` is the per-iteration
+    2q-gate count (n2q): 0 = idle-only held memory (rus_rx_ibm), 1 = rus_lowp,
+    6 = pump. Bools coerce (False->0, True->1) for the older callers."""
     sim._idle_qubit(0, dt)
-    if touch:
+    for _ in range(int(touch)):
         sim.touch_2q(0)
 
 
 def fast_unbounded(rng, calib, lam, N=1, basis="Z", p=P, touch=False,
-                   prep=_prep_psi0):
+                   prep=_prep_psi0, dt_fn=None):
     c = load_calib(calib)
     sim = QSim(1, calib=c, lam=lam, rng=rng)
     prep(sim)
-    dt = _dt_iter(c)
+    dt = (dt_fn or _dt_iter)(c)
     ktot = 0
     for _ in range(N):
         k = _draw_k(rng, p)
@@ -78,11 +80,11 @@ def fast_truncated(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False):
 
 
 def fast_knit(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False,
-              prep=_prep_psi0):
+              prep=_prep_psi0, dt_fn=None):
     c = load_calib(calib)
     sim = QSim(1, calib=c, lam=lam, rng=rng)
     prep(sim)
-    dt = _dt_iter(c)
+    dt = (dt_fn or _dt_iter)(c)
     w = 1.0
     ktot, ncut = 0, 0
     for _ in range(N):
@@ -97,7 +99,7 @@ def fast_knit(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False,
 
 
 def fast_refresh(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False,
-                 prep=_prep_psi0):
+                 prep=_prep_psi0, dt_fn=None):
     """The cheap deterministic gamma=1 REFRESH cut (proven-known-state): every C
     failing iterations, measure (end segment) + force |0> (clear leakage) +
     re-prepare the KNOWN state |psi0>. Weight is identically 1 -> ZERO sampling
@@ -106,7 +108,7 @@ def fast_refresh(rng, calib, lam, C, N=1, basis="Z", p=P, touch=False,
     c = load_calib(calib)
     sim = QSim(1, calib=c, lam=lam, rng=rng)
     prep(sim)
-    dt = _dt_iter(c)
+    dt = (dt_fn or _dt_iter)(c)
     ktot, ncut = 0, 0
     for _ in range(N):
         k = _draw_k(rng, p)

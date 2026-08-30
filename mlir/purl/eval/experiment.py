@@ -34,7 +34,12 @@ IDEAL_BLOCH = np.array([1 / math.sqrt(2), 0.5, 0.5])  # H T H T H |0>
 
 # body depth B in gate-layers per loop body (pass `purl.body_layers` on the
 # Catalyst-emitted IR). rus_rx_ibm = the IBM 2-control Toffoli body.
-B_LAYERS = {"rus_rx_ibm": 12, "rus_lowp": 12, "ipe": 12}
+B_LAYERS = {"rus_rx_ibm": 12, "rus_lowp": 12, "ipe": 12, "pump": 12}
+
+# per-iteration count of 2q gates charged to the held wire (leakage per 2q gate,
+# spec 4.1): 0 = idle-only memory, 1 = a single net-identity touch, 6 = pump's
+# CNOT-S-CNOT sandwich x3. The value the pass reports as n2q (parity, spec 6.1).
+N2Q_PER_ITER = {"rus_rx_ibm": 0, "rus_lowp": 1, "ipe": 1, "pump": 6}
 
 # a good-memory device so the window opens at low p (rus_lowp); rus uses EVAL_CALIB.
 # p_leak is the per-2q-gate leakage the carried wire accrues (spec 4.1) -- it only
@@ -45,7 +50,7 @@ GOOD_MEM = dict(gate_1q=30e-9, gate_2q=60e-9, readout=1e-6, tau=1e-6,
 
 
 def bloch_fidelity(runner, calib, lam, C, p, S, seeds, touch=False, clamp=False,
-                   ideal=None, prep=_prep_psi0):
+                   ideal=None, prep=_prep_psi0, dt_fn=None):
     """Delivered-state Bloch fidelity vs the ideal held state (S/3 per axis).
     Returns (mean fidelity, seed-std of fidelity) -- the std exposes knit's
     sampling variance vs refresh's lack of it. `clamp` (knit arm) clips the
@@ -62,10 +67,10 @@ def bloch_fidelity(runner, calib, lam, C, p, S, seeds, touch=False, clamp=False,
             for _ in range(S // 3):
                 if runner is fast_unbounded:
                     v = runner(rng, calib, lam, basis=basis, p=p, touch=touch,
-                               prep=prep)[0]
+                               prep=prep, dt_fn=dt_fn)[0]
                 else:
                     v = runner(rng, calib, lam, C, basis=basis, p=p, touch=touch,
-                               prep=prep)[0]
+                               prep=prep, dt_fn=dt_fn)[0]
                 vals.append(v)
             comp[basis] = float(np.mean(vals))
         a = np.array([comp["X"], comp["Y"], comp["Z"]])
@@ -77,24 +82,25 @@ def bloch_fidelity(runner, calib, lam, C, p, S, seeds, touch=False, clamp=False,
     return float(np.mean(per_seed)), float(np.std(per_seed))
 
 
-def depths(calib, lam, p, S, seeds, touch=False, prep=_prep_psi0):
+def depths(calib, lam, p, S, seeds, touch=False, prep=_prep_psi0, dt_fn=None):
     """Realized trip counts on the unbounded arm -> mean/max coherent depth."""
     ks = []
     for sd in range(seeds):
         rng = np.random.default_rng(1400 + sd)
         for _ in range(S):
-            ks.append(fast_unbounded(rng, calib, lam, p=p, touch=touch, prep=prep)[1])
+            ks.append(fast_unbounded(rng, calib, lam, p=p, touch=touch, prep=prep,
+                                     dt_fn=dt_fn)[1])
     return float(np.mean(ks)), int(np.min(ks)), int(np.max(ks))
 
 
 def refresh_c_sweep(calib, p, S, seeds, C_lo, C_hi, touch, ideal=None,
-                    prep=_prep_psi0):
+                    prep=_prep_psi0, dt_fn=None):
     """Spec 8.1 step 4: at lam=1 sweep C over the window on the refresh arm and
     return the empirical best-fidelity C* (what S4 checks the window brackets)."""
     best_C, best_F = None, -1.0
     for C in range(max(1, C_lo), C_hi + 1):
         F, _ = bloch_fidelity(fast_refresh, calib, 1.0, C, p, S, seeds, touch=touch,
-                              ideal=ideal, prep=prep)
+                              ideal=ideal, prep=prep, dt_fn=dt_fn)
         if F > best_F:
             best_F, best_C = F, C
     return best_C, best_F
@@ -103,7 +109,7 @@ def refresh_c_sweep(calib, p, S, seeds, C_lo, C_hi, touch, ideal=None,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", default="rus_rx_ibm",
-                    choices=["rus_rx_ibm", "rus_lowp", "ipe"])
+                    choices=["rus_rx_ibm", "rus_lowp", "ipe", "pump"])
     ap.add_argument("-S", type=int, default=6000)
     ap.add_argument("--seeds", type=int, default=8)
     ap.add_argument("--ibm", action="store_true",
@@ -125,16 +131,20 @@ def main():
         import benchmarks.rus_lowp as bench
     elif args.bench == "ipe":
         import benchmarks.ipe as bench
+    elif args.bench == "pump":
+        import benchmarks.pump as bench
     else:
         import benchmarks.rus_rx_ibm as bench
     p = bench.P_ANALYTIC
 
-    # rus_lowp / ipe entangle the carried target each iteration (spec 5.1) -> per-2q
-    # leakage accrues on it; rus_rx_ibm holds it idle (no 2q gate) -> zero leakage.
-    touch = args.bench in ("rus_lowp", "ipe")
+    # per-iteration 2q-gate count on the held wire (spec 4.1 leakage): rus_lowp/ipe
+    # touch once, pump 6x, rus_rx_ibm holds idle (0). Threaded as `touch` (int).
+    touch = N2Q_PER_ITER[args.bench]
     # per-benchmark held state (default the H T H T H |0> magic state; ipe holds |+>)
     ideal = getattr(bench, "IDEAL_BLOCH", IDEAL_BLOCH)
     prep = getattr(bench, "prep_fast", _prep_psi0)
+    # optional per-benchmark per-iteration idle time (pump's coin has 1 ancilla, not 3)
+    dt_fn = getattr(bench, "dt_iter", None)
 
     if args.ibm:
         # real IBM Eagle r3 data for the carried qubit; leakage is read from the
@@ -146,7 +156,7 @@ def main():
         calib = load_calib(cc)
         src = f"IBM Eagle r3 (qubit {args.carry_qubit}, p_leak/2q={cc['p_leak']:g})"
     else:
-        good = args.bench in ("rus_lowp", "ipe")
+        good = args.bench in ("rus_lowp", "ipe", "pump")
         calib = dict(GOOD_MEM) if good else dict(EVAL_CALIB)
         src = "held-memory device" if good else "leakage-dominated"
     B = B_LAYERS[args.bench]
@@ -173,7 +183,7 @@ def main():
 
     # spec 8.1 step 4 / S4: refresh C-sweep at lam=1 -> empirical best C*
     Cstar, Fstar = refresh_c_sweep(calib, p, S, seeds, 1, max(1, C_max), touch,
-                                   ideal=ideal, prep=prep)
+                                   ideal=ideal, prep=prep, dt_fn=dt_fn)
     brackets = 1 <= Cstar <= C_max
     print(f"  refresh C-sweep (lam=1): best C* = {Cstar} (F={Fstar:.4f}); "
           f"window [1,{C_max}] {'brackets' if brackets else 'does NOT bracket'} "
@@ -223,14 +233,16 @@ def main():
           f"{'unbounded':>11} {'knit(g4)*':>16} {'refresh(g1)':>15}")
     rows = []
     for lam in (0.0, 0.25, 0.5, 1.0, 2.0, 4.0):
-        mk, nk, xk = depths(calib, lam, p, S, seeds, touch=touch, prep=prep)
+        mk, nk, xk = depths(calib, lam, p, S, seeds, touch=touch, prep=prep,
+                            dt_fn=dt_fn)
         fu, su = bloch_fidelity(fast_unbounded, calib, lam, C, p, S, seeds,
-                                touch=touch, ideal=ideal, prep=prep)
+                                touch=touch, ideal=ideal, prep=prep, dt_fn=dt_fn)
         fd, sd = bloch_fidelity(fast_refresh, calib, lam, C_refresh, p, S, seeds,
-                                touch=touch, ideal=ideal, prep=prep)
+                                touch=touch, ideal=ideal, prep=prep, dt_fn=dt_fn)
         if knit_ok:
             fq, sq = bloch_fidelity(fast_knit, calib, lam, C, p, S, seeds,
-                                    touch=touch, clamp=True, ideal=ideal, prep=prep)
+                                    touch=touch, clamp=True, ideal=ideal, prep=prep,
+                                    dt_fn=dt_fn)
             knit_cell = f"{fq:8.4f}±{sq:.4f}"
             fq_csv, sq_csv = round(fq, 4), round(sq, 4)
         else:

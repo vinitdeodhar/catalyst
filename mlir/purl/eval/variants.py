@@ -36,7 +36,7 @@ def make_variant(leak, leak_spread=0.0):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bench", default="rus_lowp",
-                    choices=["rus_lowp", "rus_rx_ibm", "ipe"])
+                    choices=["rus_lowp", "rus_rx_ibm", "ipe", "pump"])
     ap.add_argument("--leaks", type=float, nargs="+",
                     default=[0.0, 5e-4, 1e-3, 2e-3],
                     help="per-2q-gate leakage rates (leak_2q_default) to sweep")
