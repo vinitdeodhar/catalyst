@@ -1154,3 +1154,141 @@ purl/
 - On **real IBM Eagle r3** coherence, `rus_lowp` (mean hold ~10 iters) decoheres
   substantially and refresh recovers several percent of delivered fidelity —
   the headline positive result.
+- On `ipe_project_fast` the **knit** gain is only marginal and does *not* scale
+  with leakage. Two structural reasons (the levers of §12 target both): the
+  variance window forces a large cut period (`C_min≈5`, cap≈10 → at most one cut
+  per shot, in the far tail of the exit distribution), and the estimator pays the
+  full quasi-probability weight for **leaked garbage reads** (a leaked wire reads a
+  random ±1, §5.1, then multiplied by the signed weight), so knit's *variance rises*
+  with leakage and swamps the small leakage-clearing signal. Knit is an **unbiased
+  estimator**, not a physical corrector (the Markovian no-go above), so its value is
+  bounded by the cut-touched shot fraction — here ~5%.
+
+---
+
+## 12. Knit improvement levers (roadmap — not yet implemented)
+
+Three independent, independently-testable levers that address the §11 `ipe_project`
+finding (marginal, non-leakage-scaling knit gain). Each is an **unbiased**
+transformation — conditional-mean substitution or stratification, never
+post-selection — so **no shot is ever dropped**. Expected gains are **bounded**: the
+variance window caps the cut-touched shot fraction near 5%, so these are graded on
+**correctness and variance reduction**, with the fidelity delta reported *whatever it
+is* (do not tune toward a target). Constraints that hold across all three: γ stays 4
+and `V_max` stays 4 (the γ=3 classically-communicated decomposition is **out of
+scope**, §12.5); **no lever may change refresh behavior** — `rus`/`ipe`/`pump`
+refresh runs must reproduce published numbers byte-identically under fixed seeds
+(regression gate).
+
+### 12.1 Lever A — age-triggered cutting (pass + cost model + IR)
+
+Two integers replace the single period: threshold `A` (first cut when the iteration
+counter reaches `A`) and period `C` (subsequent cuts every `C` after the first). The
+existing scheme is exactly `A = C`. For a shot running `T` iterations:
+
+```
+K(T) = 0                        if T <= A
+K(T) = 1 + floor((T - A) / C)   otherwise
+```
+
+Coherence: every segment must fit the budget, so `A <= C_max` and `C <= C_max`
+(`C_max` as today). **Rederived variance window** (not bolted on): with
+`q_A = (1-p)^A`, `q_C = (1-p)^C`, `g = γ² = 16`,
+
+```
+V(A,C) = (1 - q_A) + q_A · g·(1 - q_C) / (1 - g·q_C)     (valid when g·q_C < 1)
+```
+
+from `P(K=0)=1-q_A`, `P(K=k)=q_A·q_C^(k-1)·(1-q_C)` for `k>=1`, and `V = E[g^K]`
+summed geometrically. **`A = C` must reduce to the existing `V(C) = (1-q)/(1-g·q)`
+algebraically** — pin this identity with a unit test *before* touching anything; if
+it fails, the derivation has a transcription bug and this section should be flagged,
+not silently patched. Admissibility `V(A,C) <= V_max` (=4). `V` is monotone
+decreasing in `A`, so a large threshold buys admissibility even where the periodic
+window was empty. Selection: arg-min of the existing bias+statistical cost objective
+over the grid `A ∈ [1, C_max]`, `C ∈ [C_min_cond, C_max]` (`C_min_cond` = smallest
+`C` keeping `g·q_C < 1`); grid ≤ `C_max²`, no cleverness needed. The mean-age term
+(`s_bar`, §3.5/§3.6) generalizes to the two-phase segmentation `[1..A]` then `[1..C]`
+repeating — one shared derivation comment referencing this section; the periodic
+special case must stay **byte-identical** (FileCheck-pinned). **IR:** the knit guard
+becomes `counter >= A and (counter - A) mod C == 0`, and the emitted attributes gain
+`purl.cut_threshold = A` alongside `purl.cut_period = C`; the qcut region, weight
+threading, and expval legalization are untouched.
+
+### 12.2 Lever B — leakage-aware cut readout (simulator + one calib field)
+
+At a cut the outgoing carrier is measured in the sampled basis; today a **leaked**
+carrier returns a garbage read (§5.1) that is then multiplied by the signed weight.
+New behavior: with probability `d3` the readout **identifies** the leaked state
+(three-level discrimination), and the estimator substitutes the **conditional
+expectation of the cut observable given leakage** for the sampled read; with prob
+`1 - d3` the read stays garbage as today. This is **Rao-Blackwellization** (replace a
+random variable by its conditional mean on a data-identified event) — unbiased and
+cannot increase variance; state that in code comments, it is the part a reviewer
+checks. The shot's weight is retained through the substitution; no shot dropped, no
+reweighting. The leaked-state conditional expectation (for absorbing-leaked axis
+measurements it is a **constant**) must be **derived once in code and tested at the
+`lam=0` limit**, not hardcoded as an unexplained number. **Calibration:** a new
+*optional* top-level JSON field `readout_3level_fidelity` (float [0,1] = `d3`),
+following the §4.1 leakage conventions — validated like the leakage fields, a
+`leak_source`-style provenance string required when the generator writes it, default
+0.9 when absent; **`d3 = 0` reproduces current behavior exactly** (regression gate).
+Delivered-state fidelity *prediction* is **unchanged** (this lever changes the
+estimator, not the physics), so the S3 predicted↔measured criterion is untouched;
+the expected observable effect is **smaller RMSE / seed spread on knit arms with
+nonzero leakage**.
+
+### 12.3 Lever C — correlated term sampling (eval + sampling hook only)
+
+Each cut currently samples one decomposition term per shot, independently. Replace
+with **stratified allocation**: over the per-config shot budget, assign terms in
+fixed proportions `|w_i| / γ` via a deterministic low-discrepancy schedule keyed by
+the run seed (a shuffled repeating block suffices); shots with multiple cuts
+stratify per cut index. Additionally use **common random numbers** for the noise
+stream between the unbounded and knit arms of the same seed, so arm-to-arm
+comparisons difference out shared noise. Exact-proportion stratification preserves
+unbiasedness (same expectation, smaller variance) — note the argument in comments.
+**Zero pass/IR changes**; lives entirely in `mlir/purl/eval/` and the simulator's
+sampling hook. The stratification schedule must be a **pure function of
+`(seed, config, cut_index)`** so fixed seeds reproduce runs byte-for-byte.
+
+### 12.4 Landing order, evaluation, tests, acceptance
+
+**Order** (each merges behind its own green gate; a later lever must not be needed to
+validate an earlier one): **C first** (eval-only, immediate RMSE payoff, no IR risk),
+then **B** (simulator + one calib field), then **A** (pass + cost model + FileCheck
+churn).
+
+**Evaluation.** Target `ipe_project_fast` with the elevated-leakage variant (`1e-2`,
+§4.1), standard sweep (§8.3). Four cumulative configs: baseline, +C, +C+B, +C+B+A.
+Per config report delivered fidelity, RMSE, `E[#cuts]`, fraction of shots receiving
+≥1 cut, and predicted↔measured at nominal noise for the final config. Also run the
+**zero-leakage ablation** on the final config (lever B must be a no-op there within
+seed noise). **Regression arm:** full `rus`/`ipe` refresh sweeps, fixed seeds,
+asserted byte-identical to the published runs.
+
+**Tests.** (a) Window math: unit test pinning `V(A,C)` against a Monte-Carlo estimate
+over the geometric exit distribution, plus the `A = C` reduction identity against the
+existing implementation. (b) FileCheck `ipe_project_knit_age.mlir`: threshold guard
+emitted, `purl.cut_threshold` present, periodic case (`A = C`) byte-identical to the
+pre-change expectation. (c) Estimator: at `lam=0` lever B never fires and the
+estimate is unchanged; at `d3 = 0` bit-identical to current; at `d3 = 1` with forced
+leakage the substituted value matches the derived conditional expectation. (d)
+Stratification: term frequencies over a run match `|w_i| / γ` exactly for budgets
+divisible by the term count; determinism gate. (e) Regression: refresh benchmarks
+byte-identical; zero-leakage knit run of lever B matches baseline within seed noise.
+
+**Acceptance.** (1) All §12.4 tests green, including both regression gates. (2) RMSE
+on `ipe_project_fast` (elevated leakage) improves **monotonically** across baseline →
++C → +C+B with **non-overlapping seed error bars** for the combined effect. (3)
+Lever A's selected `(A, C)` is emitted in the decision attributes and the window unit
+test covers the deployed calibration's actual values for both `ipe_project` configs.
+(4) The final-config fidelity delta vs baseline is reported with error bars, whatever
+its size, alongside the fraction-of-shots-cut figure that explains it.
+
+### 12.5 Out of scope
+
+The γ=3 classically-communicated wire-cut decomposition (not verified against the
+literature — do not implement or scaffold for it); the LRU-scrub strategy (separate
+spec if commissioned); any change to `V_max`, γ, or the qcut decomposition itself;
+multi-qubit carry; post-selection or shot discarding in any form.
