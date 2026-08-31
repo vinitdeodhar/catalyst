@@ -4,20 +4,20 @@ U=Rz(2pi/7), input cos(pi/8)|0>+sin(pi/8)|1>; per-shot reference = winner
 [faithful] p~0.12, knit window EMPTY -> strategy NONE (unbounded arm only)
     lam |  F_unbounded
    0.00 | 0.9961±0.0009
-   0.25 | 0.9945±0.0011
-   0.50 | 0.9918±0.0009
-   1.00 | 0.9870±0.0012
-   2.00 | 0.9795±0.0020
-   4.00 | 0.9602±0.0025
+   0.25 | 0.9939±0.0008
+   0.50 | 0.9916±0.0013
+   1.00 | 0.9873±0.0013
+   2.00 | 0.9782±0.0035
+   4.00 | 0.9638±0.0053
 
 [fast] p~0.4, knit C=6, round cap=10. Leakage ablation @ lam=1:
    leak/2q |  F_unbounded |         F_knit |           gain
      0e+00 | 0.9189±0.0058 | 0.9373±0.0255 | +0.0184±0.0262 ~0 (within noise)
-     1e-03 | 0.9187±0.0044 | 0.9279±0.0145 | +0.0092±0.0152 ~0 (within noise)
-     1e-02 | 0.9095±0.0045 | 0.9222±0.0148 | +0.0128±0.0154 ~0 (within noise)
+     1e-03 | 0.9203±0.0043 | 0.9258±0.0201 | +0.0055±0.0205 ~0 (within noise)
+     1e-02 | 0.9118±0.0037 | 0.9201±0.0127 | +0.0083±0.0133 ~0 (within noise)
   (knit is an UNBIASED estimator here -- refresh is unsound; its variance is
    high because ipe_project's posterior stop couples to the cuts.)
 
 [falsification] faithful @ lam=1: a DELIBERATELY INVALID forced refresh
-  F_valid(unbounded)=0.9870   F_forced_refresh=0.8432±0.0072  (collapses toward input overlap ~0.75)
+  F_valid(unbounded)=0.9873   F_forced_refresh=0.8465±0.0071  (collapses toward input overlap ~0.75)
   -> refresh on an unknown carried state changes the computation (the no-go).

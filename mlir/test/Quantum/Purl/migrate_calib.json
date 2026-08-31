@@ -1,0 +1,21 @@
+{
+  "device": "migrate-test (synthetic coupling map)",
+  "n_qubits": 3,
+  "gate_1q_time": 3e-8,
+  "gate_2q_time": 6e-7,
+  "readout_time": 1e-6,
+  "tau": 1e-6,
+  "p_prep": 1e-3,
+  "leak_2q_default": 2e-2,
+  "leak_source": "synthetic test fixture",
+  "qubits": [
+    { "T1": 1.0e-2, "T2": 1.0e-2, "gate_1q_err": 2e-4, "readout_err": 2e-3 },
+    { "T1": 1.0e-2, "T2": 1.0e-2, "gate_1q_err": 2e-4, "readout_err": 2e-3 },
+    { "T1": 1.0e-2, "T2": 1.0e-2, "gate_1q_err": 2e-4, "readout_err": 2e-3 }
+  ],
+  "edges": [
+    { "qubits": [0, 1], "gate_2q_err": 1e-4, "leak_2q": 1e-4 },
+    { "qubits": [0, 2], "gate_2q_err": 8e-3, "leak_2q": 2e-2 },
+    { "qubits": [1, 2], "gate_2q_err": 8e-3, "leak_2q": 2e-2 }
+  ]
+}

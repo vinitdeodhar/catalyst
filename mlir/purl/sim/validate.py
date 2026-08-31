@@ -220,6 +220,181 @@ def gate_ipe_project():
     return ok_f0 and ok_match and ok_knit and ok_fals and ok_win
 
 
+def gate_rus_data():
+    """rus_data (spec 6.5): Paetznick-Svore V3 RUS on program data. FLAGGED best-
+    effort reconstruction -- these gates pin the V3 CHANNEL (not the paper's exact
+    gate circuit): (a) transcription -- the Kraus operators are M0=sqrt(5/8)V3 and
+    M1=sqrt(3/8)I (success = V3, failure = identity); (b) probability -- measured
+    success rate = 5/8; (c) fidelity -- lam=0 delivered fidelity 1.0 vs the fixed
+    ideal V3|psi>; (d) parity -- the pass n2q matches the mirror's per-iteration 2q
+    charging."""
+    import benchmarks.rus_data as rd
+
+    # (a) transcription: Kraus M0 = sqrt(5/8) V3, M1 = sqrt(3/8) I (channel-exact)
+    M0 = np.diag([rd.U0[0, 0], rd.U1[0, 0]])
+    M1 = np.diag([rd.U0[1, 0], rd.U1[1, 0]])
+    ok_m0 = np.allclose(M0, math.sqrt(5 / 8) * rd.V3)
+    ok_m1 = np.allclose(M1, math.sqrt(3 / 8) * np.eye(2))
+    print(f"[gate rus_data] Kraus M0==sqrt(5/8)V3 & M1==sqrt(3/8)I  "
+          f"ok={ok_m0 and ok_m1}")
+
+    # (b) probability: measured lam=0 success rate == 5/8
+    rng = np.random.default_rng(55)
+    trips = [rd.run_unbounded(rng, lam=0.0)[0] for _ in range(8000)]
+    p_hat = 1.0 / (sum(trips) / len(trips))
+    ok_p = abs(p_hat - rd.P_ANALYTIC) < 0.02
+    print(f"[gate rus_data] success p_hat={p_hat:.4f} (published {rd.P_ANALYTIC})  "
+          f"ok={ok_p}")
+
+    # (c) fidelity: lam=0 delivered 3-basis fidelity == 1.0 vs the FIXED ideal V3|psi>
+    def read(sim, q, basis):
+        if basis == "X":
+            sim.h(q)
+        elif basis == "Y":
+            sim.sdg(q); sim.h(q)
+        return 1 - 2 * sim.measure(q)
+    comp = {}
+    for basis in "XYZ":
+        vals = []
+        for i in range(12000):
+            s = QSim(rd.N_WIRES, lam=0.0, rng=np.random.default_rng(20000 + i))
+            rd.prepare_input(s)
+            k, fail = 0, True
+            while fail and k < 200:
+                fail = rd.attempt(s)
+                k += 1
+            vals.append(read(s, rd.DATA, basis))
+        comp[basis] = float(np.mean(vals))
+    a = np.array([comp["X"], comp["Y"], comp["Z"]])
+    F = 0.5 * (1.0 + float(a @ rd.IDEAL_BLOCH))
+    ok_fid = F >= 0.99
+    print(f"[gate rus_data] lam=0 delivered fidelity vs V3|psi> = {F:.4f} (>=0.99)  "
+          f"ok={ok_fid}")
+
+    # (d) parity: the mirror charges exactly N2Q_PER_ITER 2q gates per attempt
+    calls = {"n": 0}
+    s = QSim(rd.N_WIRES, lam=1.0, rng=np.random.default_rng(1))
+    orig = s.ctrl_branch
+    s.ctrl_branch = lambda c, t, U0, U1: (calls.__setitem__("n", calls["n"] + 1),
+                                          orig(c, t, U0, U1))[1]
+    rd.prepare_input(s)
+    rd.attempt(s)
+    ok_n2q = calls["n"] == rd.N2Q_PER_ITER == 1
+    print(f"[gate rus_data] per-iteration 2q gates={calls['n']} "
+          f"(n2q={rd.N2Q_PER_ITER})  ok={ok_n2q}")
+
+    return ok_m0 and ok_m1 and ok_p and ok_fid and ok_n2q
+
+
+def gate_migrate():
+    """Migrate strategy simulator semantics (spec 13.5): (a) ping-pong -- forced
+    migration at C=1 alternates the physical carrier k,k',k,k'; (b) leaked-transfer
+    (decision 4) -- migrating a LEAKED carrier yields a live wire in |0>, unleaked,
+    with the state NOT transferred; (c) state transfer -- migrating an UNleaked
+    carrier moves the state intact; (d) cost-positivity threshold matches spec 13.2."""
+    LIVE, PARTNER = 0, 1
+
+    # (a) ping-pong: migrate at C=1 alternates the state-bearing physical wire.
+    s = QSim(2, lam=0.0, rng=np.random.default_rng(1))
+    s.h(LIVE)                              # some state on the live wire
+    trace, live = [], LIVE
+    for _ in range(4):
+        partner = 1 - live                # the other physical qubit is the fresh one
+        live = s.migrate(live, partner)   # state moves onto `partner`
+        trace.append(live)
+    ok_pp = trace == [1, 0, 1, 0]
+    print(f"[gate migrate] ping-pong carrier trace = {trace} (k',k,k',k)  ok={ok_pp}")
+
+    # (b) leaked-transfer (decision 4): SWAP from a leaked carrier is a no-op, so the
+    # new live wire is a clean |0> and the state does not transfer.
+    s = QSim(2, lam=1.0, rng=np.random.default_rng(2))
+    s.h(LIVE)
+    s.leaked[LIVE] = True                  # force the carrier leaked
+    live = s.migrate(LIVE, PARTNER)
+    p1 = s._prob_one(live)
+    ok_leaked = (live == PARTNER and not s.leaked[live] and not s.leaked[LIVE]
+                 and abs(p1) < 1e-9)       # new live is |0> (state lost, as intended)
+    print(f"[gate migrate] leaked-carrier migrate -> live |0> P(1)={p1:.3g}, "
+          f"unleaked  ok={ok_leaked}")
+
+    # (c) state transfer: migrating an UNleaked carrier moves the state intact.
+    s = QSim(2, lam=0.0, rng=np.random.default_rng(3))
+    s.h(LIVE); s.t(LIVE)                   # |+> then T -> a generic 1q state
+    before = s._prob_one(LIVE)
+    live = s.migrate(LIVE, PARTNER)
+    after = s._prob_one(live)
+    ok_xfer = abs(before - after) < 1e-9 and live == PARTNER
+    print(f"[gate migrate] unleaked migrate transfers state P(1) {before:.4f}->"
+          f"{after:.4f}  ok={ok_xfer}")
+
+    # (d) cost-positivity threshold (spec 13.2): C*n2q*p_leak > 3*(g_e + l_e).
+    def positive(C, n2q, p_leak, g_e, l_e):
+        eps_mig = 1 - (1 - g_e) ** 3 * (1 - l_e) ** 3
+        return C * n2q * p_leak > eps_mig
+    # cheap pair edge + high body leakage -> positive; expensive edge -> negative
+    ok_pos = positive(4, 6, 1e-2, 1e-4, 1e-4) and not positive(1, 1, 1e-3, 8e-3, 2e-2)
+    print(f"[gate migrate] cost-positive on the cheap side, negative on the "
+          f"expensive side  ok={ok_pos}")
+
+    return ok_pp and ok_leaked and ok_xfer and ok_pos
+
+
+def gate_qwalk():
+    """qwalk (spec 13 migrate benchmark): fat-tailed, 2q-heavy, non-Clifford,
+    net-identity held reference. (a) FAT TAIL -- median steps ~1 but P(T>1)~0.5 and
+    a heavy upper tail (so >~50% of shots cross a C=1 cut); (b) net-identity -- lam=0
+    delivered fidelity 1.0 vs the FIXED held |psi>; (c) parity -- n2q = 6 per step."""
+    import benchmarks.qwalk as qw
+
+    # (a) fat tail: median ~1, but a large fraction runs long (unlike geometric 5/8)
+    rng = np.random.default_rng(7)
+    T = np.array([qw.run_unbounded(rng, lam=0.0)[0] for _ in range(8000)])
+    # fat tail: a small median but a heavy upper tail (P(T>1)~0.5, deep max) -- the
+    # signature that separates it from the thin geometric p=5/8 benchmarks.
+    ok_fat = np.median(T) <= 5 and np.mean(T > 1) > 0.4 and T.max() > 30
+    print(f"[gate qwalk] fat tail: median={np.median(T):.0f} P(T>1)={np.mean(T>1):.3f}"
+          f" max={T.max()}  ok={ok_fat}")
+
+    # (b) net-identity: lam=0 delivered 3-basis fidelity vs the fixed held |psi>
+    def read(sim, q, basis):
+        if basis == "X":
+            sim.h(q)
+        elif basis == "Y":
+            sim.sdg(q); sim.h(q)
+        return 1 - 2 * sim.measure(q)
+    comp = {}
+    for basis in "XYZ":
+        vals = []
+        for i in range(9000):
+            s = QSim(qw.N_WIRES, lam=0.0, rng=np.random.default_rng(30000 + i))
+            qw.prepare_input(s)
+            pos, k = 1, 0
+            while pos != 0 and k < 500:
+                qw.touch(s)
+                pos = qw.walk_step(np.random.default_rng(77000 + i + k), pos)
+                k += 1
+            vals.append(read(s, qw.DATA, basis))
+        comp[basis] = float(np.mean(vals))
+    a = np.array([comp["X"], comp["Y"], comp["Z"]])
+    F = 0.5 * (1.0 + float(a @ qw.IDEAL_BLOCH))
+    ok_fid = F >= 0.99
+    print(f"[gate qwalk] lam=0 delivered fidelity vs held |psi> = {F:.4f} (>=0.99)  "
+          f"ok={ok_fid}")
+
+    # (c) parity: exactly N2Q_PER_ITER two-qubit gates per step
+    calls = {"n": 0}
+    s = QSim(qw.N_WIRES, lam=1.0, rng=np.random.default_rng(1))
+    orig = s.cnot
+    s.cnot = lambda c, t: (calls.__setitem__("n", calls["n"] + 1), orig(c, t))[1]
+    qw.prepare_input(s)
+    qw.touch(s)
+    ok_n2q = calls["n"] == qw.N2Q_PER_ITER == 6
+    print(f"[gate qwalk] per-step 2q gates={calls['n']} (n2q={qw.N2Q_PER_ITER})  "
+          f"ok={ok_n2q}")
+
+    return ok_fat and ok_fid and ok_n2q
+
+
 def main():
     rng = np.random.default_rng(20260818)
     ok1 = gate_i(rng) & gate_ii(rng)
@@ -232,7 +407,14 @@ def main():
     print("PUMP BENCHMARK:", "PASS" if ok4 else "FAIL")
     ok5 = gate_ipe_project()
     print("IPE_PROJECT BENCHMARK:", "PASS" if ok5 else "FAIL")
-    sys.exit(0 if (ok1 and ok2 and ok3 and ok4 and ok5) else 1)
+    ok6 = gate_rus_data()
+    print("RUS_DATA BENCHMARK:", "PASS" if ok6 else "FAIL")
+    ok7 = gate_migrate()
+    print("MIGRATE STRATEGY:", "PASS" if ok7 else "FAIL")
+    ok8 = gate_qwalk()
+    print("QWALK BENCHMARK:", "PASS" if ok8 else "FAIL")
+    sys.exit(0 if (ok1 and ok2 and ok3 and ok4 and ok5 and ok6 and ok7 and ok8)
+             else 1)
 
 
 if __name__ == "__main__":

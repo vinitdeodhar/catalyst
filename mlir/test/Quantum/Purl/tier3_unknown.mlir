@@ -1,9 +1,11 @@
-// RUN: quantum-opt --purl="calib=%S/backend_leak_nt.json p=0.1 shots=200000 margin=1.0" --purl-lower-qcut %s | FileCheck %s
+// RUN: quantum-opt --purl="calib=%S/backend_leak_nt.json p=0.1 shots=200000 margin=1.0 force-knit=true" --purl-lower-qcut %s | FileCheck %s
 //
 // The carried wire is entangled and measured in the X basis (heralding), so the
 // state is NOT provably known -> REFRESH is inapplicable. Under a heavy-tailed
-// (low p) leakage-dominated calibration the profitability model selects the
-// tier-3 quasi-probability KNIT strategy (gamma = 4).
+// (low p) leakage-dominated calibration the tier-3 quasi-probability KNIT strategy
+// (gamma = 4) applies. Since spec 13, the cost model selects MIGRATE for unknown
+// states, so knit is the comparison arm reached via force-knit=true (spec 13.7/13.8);
+// this flat calib has no coupling map, so migrate would be unavailable anyway.
 
 // CHECK: func.func private @purl_sample_term() -> (i64, i1)
 // CHECK: scf.while ({{.*}}) : (i1, !quantum.bit, i32, f64) -> (i1, !quantum.bit, i32, f64)

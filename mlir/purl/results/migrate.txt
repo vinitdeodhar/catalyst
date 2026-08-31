@@ -1,0 +1,20 @@
+=== Migrate strategy on rus_data (spec 13.7), lam=1, C=4 ===
+seeds=8, S=6000; migrate (gamma=1) vs knit (gamma^2=16) vs unbounded
+
+  leakage = elevated 1e-2
+    arm              |      F (mean+-std) |    RMSE | cutfrac
+    unbounded        | 0.9897±0.0058 | 0.0116 |      --
+    knit(g^2=16,C=4) | 0.9848±0.0068 | 0.0165 |   0.019
+    migrate(g=1,C=4) | 0.9884±0.0087 | 0.0142 |   0.019
+    migrate(g=1,C=2) | 0.9897±0.0058 | 0.0116 |   0.168   (C=2 < knit C_min: knit inadmissible)
+    migrate/knit seed-variance ratio @C=4 = 1.652 (migrate is gamma=1: no quasi-probability weights)
+
+  leakage = zero (ablation)
+    arm              |      F (mean+-std) |    RMSE | cutfrac
+    unbounded        | 0.9930±0.0069 | 0.0095 |      --
+    knit(g^2=16,C=4) | 0.9885±0.0072 | 0.0133 |   0.020
+    migrate(g=1,C=4) | 0.9955±0.0051 | 0.0065 |   0.019
+    migrate(g=1,C=2) | 0.9986±0.0078 | 0.0074 |   0.163   (C=2 < knit C_min: knit inadmissible)
+    migrate/knit seed-variance ratio @C=4 = 0.499 (migrate is gamma=1: no quasi-probability weights)
+
+  (central figure: migrate matches knit's cleared-leakage fidelity at lower variance; the zero-leakage rows isolate age-capping from clearing.)

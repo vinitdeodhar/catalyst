@@ -57,7 +57,10 @@ def PurlPass : Pass<"purl"> {
         Option<"carryQubit", "carry-qubit", "int", /*default=*/"0",
             "Physical qubit index the carried wire maps to (placement input).">,
         Option<"depth", "depth", "int", /*default=*/"0",
-            "Report purl.fidelity_at_depth at this runtime depth D in iterations (0 = off).">
+            "Report purl.fidelity_at_depth at this runtime depth D in iterations (0 = off).">,
+        Option<"forceKnit", "force-knit", "bool", /*default=*/"false",
+            "Comparison arm (spec 13.7): select KNIT for an unknown state instead of "
+            "MIGRATE (the cost model's default). Refresh/none unaffected.">
     ];
 }
 

@@ -311,32 +311,92 @@ class QSim:
         (e.g. ipe_project's cos(a)|0>+sin(a)|1> = Ry(2a)|0>)."""
         self._gate1(RY(angle), q)
 
+    def rz(self, q, angle):
+        """Arbitrary Z-rotation (non-Clifford): used with ry to prepare a generic
+        non-stabilizer data state (rus_data's |psi> = Rz(0.7) Ry(0.4)|0>)."""
+        self._gate1(RZ(angle), q)
+
+    def ctrl_branch(self, ctrl, target, U0, U1):
+        """Data-multiplexed single-qubit unitary on `target`: apply the 2x2 unitary
+        U0 to `target` when `ctrl`=|0>, U1 when `ctrl`=|1>. Realized as U0 on target
+        then (U1 U0^-1) controlled on ctrl=|1>; charged as ONE 2q gate (idle/depol/
+        leak on both wires). This is the rus_data V3-RUS gadget (a data-controlled
+        ancilla rotation, spec 6.5) -- non-Clifford, so the pass proof returns
+        unknown."""
+        if self._leaked_noop_2q([ctrl, target]):
+            return
+        self._idle_others([ctrl, target], self.calib["gate_2q"])
+        self._apply_1q(U0, target)
+        self._apply_ctrl(U1 @ np.linalg.inv(U0), [ctrl], target)
+        self._depol_nq([ctrl, target])
+        self._leak_2q([ctrl, target])
+
     def crz(self, c, tq, phi):
         """Controlled-Rz(phi): ipe_project's controlled-U^m phase kickback (spec
         6.3). Non-Clifford, so the known-state proof returns unknown. Charges one
         2q gate's idle/depolarizing/leakage on both wires, like cnot."""
+        if self._leaked_noop_2q([c, tq]):
+            return
         self._idle_others([c, tq], self.calib["gate_2q"])
         self._apply_ctrl(RZ(phi), [c], tq)
         self._depol_nq([c, tq])
         self._leak_2q([c, tq])
 
+    def _leaked_noop_2q(self, qubits):
+        """Absorbing leakage model (spec 13.5, decision 4): a two-qubit gate that
+        touches a leaked qubit is a NO-OP on the state -- it neither transfers nor
+        spreads the leaked population (so a SWAP from a leaked carrier does not move
+        the state). Spectators still decohere over the gate duration. Returns True if
+        the gate was a no-op. No effect when no qubit is leaked (lam=0 / p_leak=0)."""
+        if any(self.leaked[q] for q in qubits):
+            self._idle_others(qubits, self.calib["gate_2q"])
+            return True
+        return False
+
     def cnot(self, c, tq):
+        if self._leaked_noop_2q([c, tq]):
+            return
         self._idle_others([c, tq], self.calib["gate_2q"])
         self._apply_ctrl(X, [c], tq)
         self._depol_nq([c, tq])
         self._leak_2q([c, tq])
 
     def cz(self, c, tq):
+        if self._leaked_noop_2q([c, tq]):
+            return
         self._idle_others([c, tq], self.calib["gate_2q"])
         self._apply_ctrl(Z, [c], tq)
         self._depol_nq([c, tq])
         self._leak_2q([c, tq])
 
     def toffoli(self, a, b, tq):
+        if self._leaked_noop_2q([a, b, tq]):
+            return
         self._idle_others([a, b, tq], self.calib["gate_2q"])
         self._apply_ctrl(X, [a, b], tq)
         self._depol_nq([a, b, tq])
         self._leak_2q([a, b, tq])
+
+    def migrate(self, live, partner, pair_leak=None):
+        """MIGRATE cut (spec 13): SWAP the carried state onto the fresh `partner`
+        (three CNOTs on the pair edge) then reset the abandoned carrier. If `live` is
+        leaked the SWAP is a no-op (decision 4), so `partner` stays |0> and the leak
+        stays on `live`; the reset then clears it. Returns the new live index
+        (== `partner`); the caller ping-pongs live/partner. Unweighted (gamma=1).
+
+        `pair_leak` (spec 13.5): the leakage charged on the SWAP's three CNOTs is the
+        PAIR EDGE's `leak_2q` -- the pass picks the cheapest incident edge (spec 13.1),
+        so this is typically far below the body's global-median `p_leak`. Defaults to
+        the global `p_leak` when not given."""
+        saved = self.p_leak
+        if pair_leak is not None:
+            self.p_leak = float(pair_leak)
+        self.cnot(live, partner)
+        self.cnot(partner, live)
+        self.cnot(live, partner)
+        self.p_leak = saved
+        self.force_zero(live)     # reset the abandoned carrier (off critical path)
+        return partner
 
     def touch_2q(self, q):
         """A net-identity 2q gate on the carried wire (spec 5.1 / A4 rus_lowp

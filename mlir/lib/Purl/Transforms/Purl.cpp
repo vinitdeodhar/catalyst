@@ -68,6 +68,12 @@ struct Calib {
     double p_leak = 0.0, p_leak_ro = 0.0, p_prep = 0.0; // non-transportable
     bool unit = true; // layer counting
     bool ok = true;   // false => hard schema error (e.g. leakage missing)
+    // Migrate pair (spec 13.1): the partner edge for the carried qubit k, chosen as
+    // the incident edge minimizing 3*(gate_2q_err + leak_2q). hasPair=false => no
+    // incident edge => migrate unavailable.
+    bool hasPair = false;
+    int pairK = -1, pairKp = -1;
+    double pairG2 = 0.0, pairLeak = 0.0;
 
     // Leakage is first-class calibration data (spec 4.1): the coupling-map schema
     // MUST carry `leak_2q_default`; `diag` (if given) receives the hard error.
@@ -144,6 +150,42 @@ struct Calib {
                     c.p_leak = *ldflt;
                 c.p_leak_ro = c.p_leak * 0.5; // derived readout leakage (spec 3.6)
             }
+            // migrate pair selection (spec 13.1): among edges incident to carry
+            // qubit `qi`, pick the one minimizing 3*(gate_2q_err + leak_2q); ties ->
+            // lower partner index. hasPair stays false if qi has no incident edge.
+            double lldflt = ldflt ? *ldflt : 0.0;
+            double bestCost = INFINITY;
+            if (auto *edges = obj->getArray("edges"))
+                for (auto &e : *edges) {
+                    auto *eo = e.getAsObject();
+                    if (!eo)
+                        continue;
+                    auto *qs = eo->getArray("qubits");
+                    if (!qs || qs->size() != 2)
+                        continue;
+                    auto a = (*qs)[0].getAsInteger(), bq = (*qs)[1].getAsInteger();
+                    if (!a || !bq)
+                        continue;
+                    int other;
+                    if ((int)*a == (int)qi)
+                        other = (int)*bq;
+                    else if ((int)*bq == (int)qi)
+                        other = (int)*a;
+                    else
+                        continue;
+                    double ge = eo->getNumber("gate_2q_err").value_or(c.p2);
+                    double le = eo->getNumber("leak_2q").value_or(lldflt);
+                    double cost = 3.0 * (ge + le);
+                    if (cost < bestCost - 1e-18 ||
+                        (std::abs(cost - bestCost) <= 1e-18 && other < c.pairKp)) {
+                        bestCost = cost;
+                        c.hasPair = true;
+                        c.pairK = (int)qi;
+                        c.pairKp = other;
+                        c.pairG2 = ge;
+                        c.pairLeak = le;
+                    }
+                }
         }
         else {
             // flat calibration (durations + rates)
@@ -911,12 +953,12 @@ static double meanFidelity(const Calib &c, double Bsec, int n1q, int n2q,
 //===----------------------------------------------------------------------===//
 // Profitability cost model + strategy selection (Part 3.5). No DISCARD arm.
 //===----------------------------------------------------------------------===//
-enum class CutStrategy { None, Refresh, Knit };
+enum class CutStrategy { None, Refresh, Knit, Migrate };
 
 struct Predicted {
     CutStrategy strat = CutStrategy::None;
     int C = 0;
-    double none = 0, refresh = 0, knit = 0; // predicted expval errors
+    double none = 0, refresh = 0, knit = 0, migrate = 0; // predicted expval errors
 };
 
 // per-iteration error rates split into transportable / non-transportable
@@ -955,10 +997,14 @@ static double sbar(double p, int C)
 
 static double rmse(double bias, double stat) { return std::hypot(bias, stat); }
 
-// Select the profit-maximising strategy (3.5). tier1 = REFRESH is applicable.
+// Select the profit-maximising strategy (3.5 / 13.2). tier1 = REFRESH applicable
+// (proven state). hasPair/epsMig = MIGRATE availability + per-migration charge (spec
+// 13.1/13.2). forceKnit = the paper's knit comparison arm (spec 13.7); otherwise the
+// cost model never selects knit for an unknown state -- it selects migrate.
 static Predicted selectStrategy(double p, const EpsRates &e, const Window &win,
                                 bool tier1, int shots, double sigma0,
-                                double margin, int forceC)
+                                double margin, int forceC, bool hasPair = false,
+                                double epsMig = 0.0, bool forceKnit = false)
 {
     Predicted r;
     double Ek = 1.0 / p;
@@ -1011,17 +1057,44 @@ static Predicted selectStrategy(double p, const EpsRates &e, const Window &win,
     }
     r.knit = bestKnit;
 
-    // decision: arg-min applicable strategy, fire iff it beats NONE by margin
+    // MIGRATE (gamma = 1, spec 13.2): C in [1, cMax], NO variance floor. Non-
+    // transportable (leakage) resets per window (moved to a fresh carrier); the
+    // transportable term carries over with the state (like knit); each migration
+    // charges eps_mig (the 3-CNOT SWAP on the pair edge).
+    double bestMig = INFINITY;
+    int bestMigC = 0;
+    if (hasPair) {
+        int lo = forceC > 0 ? forceC : 1;
+        int hi = forceC > 0 ? forceC : std::max(1, win.cMax);
+        for (int C = lo; C <= hi; ++C) {
+            double bias = e.t * Ek + e.nt * sbar(p, C) + epsMig * ecuts(C);
+            double err = rmse(bias, statBase); // gamma=1 -> no variance inflation
+            if (err < bestMig) {
+                bestMig = err;
+                bestMigC = C;
+            }
+        }
+    }
+    r.migrate = bestMig;
+
+    // decision (spec 13.2): proven -> refresh; else forced knit (comparison arm);
+    // else migrate where a partner exists; else none. Fire iff it beats NONE by
+    // margin. The cost model never selects knit for an unknown state on its own.
     double bestErr = INFINITY;
-    if (bestRef < bestErr) {
+    if (tier1) {
         bestErr = bestRef;
         r.strat = CutStrategy::Refresh;
         r.C = bestRefC;
     }
-    if (bestKnit < bestErr) {
+    else if (forceKnit) {
         bestErr = bestKnit;
         r.strat = CutStrategy::Knit;
         r.C = bestKnitC;
+    }
+    else if (hasPair) {
+        bestErr = bestMig;
+        r.strat = CutStrategy::Migrate;
+        r.C = bestMigC;
     }
     if (!(bestErr * margin < r.none)) {
         r.strat = CutStrategy::None;
@@ -1294,11 +1367,16 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         CutStrategy strat;
         int C = 0;
         if (shots > 0) {
-            // Part 3.5: profitability model chooses NONE / REFRESH / KNIT and C.
+            // Part 3.5 / 13.2: cost model chooses NONE / REFRESH / MIGRATE (or KNIT
+            // via the comparison flag) and C. eps_mig = the 3-CNOT SWAP charge on the
+            // migrate pair edge at nominal noise (lam=1).
             EpsRates e = epsFromCalib(c, B, bs);
+            double epsMig =
+                1.0 - std::pow(1.0 - c.pairG2, 3) * std::pow(1.0 - c.pairLeak, 3);
             Predicted pred =
                 selectStrategy(pSuccess, e, wKnit, tier1, shots, sigma0, margin,
-                               cutPeriod > 0 ? cutPeriod : 0);
+                               cutPeriod > 0 ? cutPeriod : 0, c.hasPair, epsMig,
+                               forceKnit);
             strat = pred.strat;
             C = pred.C;
             auto f = [&](double x) {
@@ -1309,6 +1387,7 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
                               b.getNamedAttr("none", f(pred.none)),
                               b.getNamedAttr("refresh", f(pred.refresh)),
                               b.getNamedAttr("knit", f(pred.knit)),
+                              b.getNamedAttr("migrate", f(pred.migrate)),
                           }));
         }
         else {
@@ -1335,17 +1414,25 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
 
         StringRef stratStr = strat == CutStrategy::None      ? "none"
                              : strat == CutStrategy::Refresh ? "refresh"
+                             : strat == CutStrategy::Migrate ? "migrate"
                                                           : "knit";
         loop->setAttr("purl.strategy", b.getStringAttr(stratStr));
         loop->setAttr("purl.cut",
                       b.getStringAttr(strat == CutStrategy::Refresh ? "deterministic"
                                       : strat == CutStrategy::Knit  ? "quasiprobability"
+                                      : strat == CutStrategy::Migrate ? "swap"
                                                                  : "none"));
-        int wLo = strat == CutStrategy::Refresh ? 1 : wKnit.cMin;
+        // migrate has no variance floor: its window low bound is 1 (spec 13.1)
+        int wLo = (strat == CutStrategy::Refresh || strat == CutStrategy::Migrate)
+                      ? 1
+                      : wKnit.cMin;
         if (strat != CutStrategy::None) {
             loop->setAttr("purl.C", b.getI64IntegerAttr(C));
             loop->setAttr("purl.window",
                           b.getDenseI64ArrayAttr({wLo, wKnit.cMax}));
+            if (strat == CutStrategy::Migrate) // spec 13.3: the ping-pong pair
+                loop->setAttr("purl.pair",
+                              b.getDenseI64ArrayAttr({c.pairK, c.pairKp}));
         }
 
         // Time-based fidelity prediction from real hardware data (calib in
@@ -1397,10 +1484,14 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
             ok = doRewriteDeterministic(loop, rc.carryYieldIdx, C, wSel, fr, prep,
                                         (int)rc.slot);
         }
+        else if (strat == CutStrategy::Refresh) {
+            ok = doRewriteDeterministic(loop, info.carryArgIdx, C, wSel, fr, prep);
+        }
+        else if (strat == CutStrategy::Migrate) {
+            ok = doRewriteMigrate(loop, info.carryArgIdx, C, wSel, c.pairK, c.pairKp);
+        }
         else {
-            ok = strat == CutStrategy::Refresh
-                     ? doRewriteDeterministic(loop, info.carryArgIdx, C, wSel, fr, prep)
-                     : doRewrite(loop, info.carryArgIdx, C, wSel);
+            ok = doRewrite(loop, info.carryArgIdx, C, wSel);
         }
         if (!ok)
             loop.emitRemark("purl: output is not an expval of the carried "
@@ -1604,6 +1695,161 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         nl->setAttr("purl.cut", b.getStringAttr("quasiprobability"));
         nl->setAttr("purl.strategy", b.getStringAttr("knit"));
         nl->setAttr("purl.known_state", b.getStringAttr("none"));
+        return true;
+    }
+
+    // MIGRATE (gamma = 1, spec 13): the carry gains an i32 counter AND a partner
+    // qubit (ping-pong pair, spec 13.1). Every C failing iterations, SWAP the live
+    // carrier onto the fresh partner (three CNOTs), then reset the swapped-out (now
+    // idle) qubit -- the state moves WITHOUT being measured/re-prepared/known, and
+    // carrier-stuck leakage stays behind on the reset wire. Unweighted; the expval
+    // is intact (like refresh). Bare-qubit carry only.
+    bool doRewriteMigrate(scf::WhileOp loop, int carryIdx, int C, Window win,
+                          int pairK, int pairKp)
+    {
+        OpBuilder b(loop);
+        Location loc = loop.getLoc();
+        MLIRContext *ctx = b.getContext();
+        Type i32 = b.getI32Type();
+        Type qty = QubitType::get(ctx);
+        Type rty = QuregType::get(ctx);
+
+        ObsChain oc = findObsChain(loop, carryIdx);
+        if (!oc.ok)
+            return false; // output is not an expval of the carried qubit
+        int failIdx = failIndex(loop);
+        unsigned nCarry = loop.getNumResults();
+
+        // --- fresh partner qubit allocated before the loop ---
+        b.setInsertionPoint(loop);
+        Value pReg = AllocOp::create(b, loc, rty, Value(), b.getI64IntegerAttr(1));
+        Value p0 = ExtractOp::create(b, loc, qty, pReg, Value(),
+                                     b.getI64IntegerAttr(0));
+
+        // --- carry extension: +i32 counter, +partner qubit ---
+        Value c0i32 = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(0));
+        SmallVector<Value> inits(loop.getInits().begin(), loop.getInits().end());
+        inits.push_back(c0i32);
+        inits.push_back(p0);
+        SmallVector<Type> resTys(loop.getResultTypes().begin(),
+                                 loop.getResultTypes().end());
+        resTys.push_back(i32);
+        resTys.push_back(qty);
+        auto nl = scf::WhileOp::create(b, loc, resTys, inits);
+
+        // BEFORE region: forward the counter + partner through the condition.
+        Block &oldBefore = loop.getBefore().front();
+        Block *nb = b.createBlock(&nl.getBefore());
+        for (Value in : inits)
+            nb->addArgument(in.getType(), loc);
+        IRMapping bmap;
+        for (unsigned i = 0; i < oldBefore.getNumArguments(); ++i)
+            bmap.map(oldBefore.getArgument(i), nb->getArgument(i));
+        b.setInsertionPointToEnd(nb);
+        for (Operation &op : oldBefore.without_terminator())
+            b.clone(op, bmap);
+        auto oldCond = cast<scf::ConditionOp>(oldBefore.getTerminator());
+        SmallVector<Value> fwd;
+        for (Value v : oldCond.getArgs())
+            fwd.push_back(bmap.lookupOrDefault(v));
+        unsigned n = oldBefore.getNumArguments();
+        fwd.push_back(nb->getArgument(n));      // counter
+        fwd.push_back(nb->getArgument(n + 1));  // partner
+        scf::ConditionOp::create(
+            b, loc, bmap.lookupOrDefault(oldCond.getCondition()), fwd);
+
+        // AFTER region
+        Block &oldAfter = loop.getAfter().front();
+        Block *na = b.createBlock(&nl.getAfter());
+        for (BlockArgument a : oldAfter.getArguments())
+            na->addArgument(a.getType(), loc);
+        Value itArg = na->addArgument(i32, loc);
+        Value partnerArg = na->addArgument(qty, loc);
+        IRMapping amap;
+        for (unsigned i = 0; i < oldAfter.getNumArguments(); ++i)
+            amap.map(oldAfter.getArgument(i), na->getArgument(i));
+        b.setInsertionPointToEnd(na);
+        for (Operation &op : oldAfter.without_terminator())
+            b.clone(op, amap);
+        auto oldYield = cast<scf::YieldOp>(oldAfter.getTerminator());
+
+        Value c1i32 = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(1));
+        Value it1 = arith::AddIOp::create(b, loc, itArg, c1i32);
+        Value cC = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(C));
+        Value rem = arith::RemSIOp::create(b, loc, it1, cC);
+        Value zero = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(0));
+        Value atC =
+            arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, rem, zero);
+        Value failVal = amap.lookupOrDefault(oldYield.getOperand(failIdx));
+        Value failI1 = failVal;
+        if (!failI1.getType().isInteger(1) && isa<TensorType>(failI1.getType()))
+            failI1 = tensor::ExtractOp::create(b, loc, failVal, ValueRange{});
+        Value doMig = arith::AndIOp::create(b, loc, failI1, atC);
+
+        // SWAP(live, partner) via three CNOTs; after, the STATE is on the partner
+        // wire and the old carrier holds |0>. Reset the old carrier (measure + X,
+        // the codebase reset idiom) -- it becomes the next fresh partner. Yields
+        // (new_live = state wire, new_partner = reset wire) so the carry slot always
+        // holds the state and the loop ping-pongs the two physical qubits.
+        Value liveVal = amap.lookupOrDefault(oldYield.getOperand(carryIdx));
+        auto migIf = scf::IfOp::create(
+            b, loc, doMig,
+            [&](OpBuilder &tb, Location l) {
+                auto cnot = [&](Value cq, Value tq) -> std::pair<Value, Value> {
+                    auto op = CustomOp::create(tb, l, "CNOT", ValueRange{cq, tq},
+                                               ValueRange{}, ValueRange{},
+                                               ValueRange{});
+                    auto outs = op.getOutQubits();
+                    return {outs[0], outs[1]};
+                };
+                auto [x1, y1] = cnot(liveVal, partnerArg); // CNOT(live, partner)
+                auto [y2, x2] = cnot(y1, x1);              // CNOT(partner, live)
+                auto [x3, y3] = cnot(x2, y2);              // CNOT(live, partner)
+                // x3 holds |0> (old partner), y3 holds the state (old live)
+                Value newLive = y3;
+                // reset the swapped-out wire x3 -> fresh |0> partner
+                auto m = MeasureOp::create(tb, l, tb.getI1Type(), qty, x3,
+                                           IntegerAttr());
+                Value newPartner =
+                    guarded(tb, l, m.getMres(), m.getOutQubit(),
+                            [&](OpBuilder &gb, Value in) {
+                                return gate(gb, l, "PauliX", in);
+                            });
+                scf::YieldOp::create(tb, l, ValueRange{newLive, newPartner});
+            },
+            [&](OpBuilder &eb, Location l) {
+                scf::YieldOp::create(eb, l, ValueRange{liveVal, partnerArg});
+            });
+        Value newQ = migIf.getResult(0), newPartner = migIf.getResult(1);
+
+        SmallVector<Value> ny;
+        for (unsigned i = 0; i < oldYield.getNumOperands(); ++i) {
+            Value v = amap.lookupOrDefault(oldYield.getOperand(i));
+            ny.push_back(i == (unsigned)carryIdx ? newQ : v);
+        }
+        ny.push_back(it1);
+        ny.push_back(newPartner);
+        scf::YieldOp::create(b, loc, ny);
+
+        for (unsigned i = 0; i < nCarry; ++i)
+            loop.getResult(i).replaceAllUsesWith(nl.getResult(i));
+        loop.erase();
+
+        // clean up the partner register after the loop (its final value is unused)
+        b.setInsertionPointAfter(nl);
+        Value partnerFinal = nl.getResult(nCarry + 1);
+        Value pReg2 = InsertOp::create(b, loc, rty, pReg, Value(),
+                                       b.getI64IntegerAttr(0), partnerFinal);
+        DeallocOp::create(b, loc, pReg2);
+
+        nl->setAttr("purl.applied", b.getBoolAttr(true));
+        nl->setAttr("purl.C", b.getI64IntegerAttr(C));
+        nl->setAttr("purl.cut_period", b.getI64IntegerAttr(C));
+        nl->setAttr("purl.window", b.getDenseI64ArrayAttr({win.cMin, win.cMax}));
+        nl->setAttr("purl.cut", b.getStringAttr("swap"));
+        nl->setAttr("purl.strategy", b.getStringAttr("migrate"));
+        nl->setAttr("purl.known_state", b.getStringAttr("none"));
+        nl->setAttr("purl.pair", b.getDenseI64ArrayAttr({pairK, pairKp}));
         return true;
     }
 

@@ -1,0 +1,18 @@
+=== Migrate on the fat-tailed qwalk benchmark (spec 13.7), lam=1 ===
+seeds=8, S=6000; random-walk hitting-time herald, n2q=6, ideal held Bloch=[0.298 0.251 0.921]
+
+  leakage = elevated 1e-2
+    arm                |      F (mean+-std) |    RMSE | cutfrac
+    unbounded          | 0.8421±0.0104 | 0.1582 |      --
+    knit(g^2=16,C=4)   | 0.4410±0.3229 | 0.6354 |   8.467
+    migrate(g=1,C=1)   | 0.9328±0.0042 | 0.0673 |  33.488
+    migrate gain over unbounded = +0.0907 ± 0.0040  (+22.8 sigma)
+
+  leakage = zero (ablation)
+    arm                |      F (mean+-std) |    RMSE | cutfrac
+    unbounded          | 0.9463±0.0057 | 0.0540 |      --
+    knit(g^2=16,C=4)   | 0.4357±0.2663 | 0.6168 |   8.407
+    migrate(g=1,C=1)   | 0.9323±0.0078 | 0.0680 |  34.022
+    migrate gain over unbounded = -0.0139 ± 0.0034  (-4.1 sigma)
+
+  (fat tail -> high cut fraction -> migrate clears leakage on most shots at gamma=1; knit's variance floor forbids the small C that would match it.)
