@@ -730,6 +730,7 @@ state `|psi0> = H T H T H |0>`, and return `qml.expval(PauliZ(target))`.
 | `rus_lowp` | 0.1 | **CNOT-heralded** (Clifford + CNOT ancilla; identity on the target on failure) | low-p heavy-tail regime (quantum-repeater / heralded memory); mean trip count 10 — where cutting is meant to help |
 | `pump` | 0.1 | **CNOT-sandwich ×3** (Clifford; identity on the held data each iteration; **6 two-qubit gates/iter**) | entanglement-pumping proxy (§6.1); leakage-heavy carry — the primary consumer of the per-2q leakage model (§4.1) |
 | `ipe_project` | ~0.12 / ~0.45 | **controlled-Rz(θ)** (non-Clifford; each round partially projects the carried superposition — the carried state is **outcome-dependent**) | phase-estimation-as-projection (§6.3); the **knit-only** benchmark (refresh is *unsound in principle*), with a refresh falsification arm |
+| `rus_data` | ~5/8 | **Paetznick–Svore RUS `V3`** (non-Clifford synthesis applied to arbitrary program *data*; identity-on-failure) | knit-only via the *cited protocol's own* non-Clifford data premise (§6.5); cleanest delivered-fidelity metric (fixed ideal `V3|ψ⟩`, no per-shot reference) |
 
 Most hold the same magic-state input and identical carried-qubit *physics*; they
 differ in the trip distribution (`p`), stage count (`N`), the 2q-gate load per
@@ -747,6 +748,12 @@ which §3.4 cannot prove, so they fall back to KNIT/NONE. Expected pass outcomes
 | `pump` | carry | identity | **refresh** (window `[1,2]`; leakage-clearing gain, §6.1) |
 | `ipe_project` (faithful) | carry | unknown | **none** (knit window empty, `C_min≈24 > C_max`; §6.3) |
 | `ipe_project_fast` | carry | unknown | **knit** — the knit-arm positive result (non-empty window at p≈0.45, B≈4, f=0.15; §6.3) |
+| `rus_data` | carry | unknown | **knit** where the window is non-empty (`C_min≈4` at p≈5/8), else **none**; never refresh (§6.5) |
+
+Note (roadmap): the **migrate** strategy (§13) supersedes knit as the cost model's
+choice for `unknown` states. Once §13 lands, the `unknown` rows above become **migrate
+or none** (knit stays reachable only via the force flag); the `known_state`/refresh rows
+are unchanged.
 
 ### 6.1 `pump` — entanglement-pumping proxy
 
@@ -928,6 +935,96 @@ bibliography**, and omit DOIs rather than guess.
   small-scale (noisy) experiments.* New J. Phys. **21**, 023022 (2019). — IPE under
   realistic noise (practice anchor).
 
+### 6.5 `rus_data` — RUS gate synthesis applied to program data
+
+**What it models & why (spec role).** `rus_data` runs the *original* repeat-until-
+success setting of Paetznick–Svore: a synthesized **non-Clifford** rotation applied to
+an **arbitrary program state** mid-computation. The carried qubit is the algorithm's
+own data, prepared through non-Clifford gates, so the known-state analysis must return
+`unknown` and refresh is unsound within Purl's framework. This gives a **knit-only**
+benchmark whose unknown-ness is the *cited protocol's own premise* — more legitimate
+than `ipe_project`'s constructed projection and far more than an unknown-state pump
+variant. Its delivered-fidelity metric is the **cleanest** of any knit benchmark:
+because failure is identity, the ideal final state `V3|ψ⟩` is fixed (trip-count
+independent), so **no per-shot reference** is needed (unlike §6.3).
+
+**Nuance to preserve (comments + paper).** Here the carried state happens to be
+**constant** across iterations (the failure branch is identity on data), so a
+*clairvoyant* compiler could refresh. Purl declines because it **cannot certify a
+non-Clifford state**, and in the protocol's intended use the data is arbitrary
+mid-algorithm state, so **no** compiler could. So `rus_data` also demonstrates that
+`unknown` is the analysis being conservative **exactly where the literature says it
+must be** — not a limitation, the correct answer.
+
+**Definition.** Two lockstep artifacts (a `@qjit` program lowered to MLIR + a Python
+mirror). *Data wire `d`* prepared once before the loop in a generic non-Clifford state
+`|ψ⟩ = Rz(0.7) Ry(0.4)|0⟩` (arbitrary fixed angles, well away from every stabilizer
+state); never measured in the loop. *Ancilla register*: reset and reused each
+iteration, fixed allocation. Body per iteration: the **Paetznick–Svore RUS circuit for
+the axial rotation `V3`** (the `(I + 2iZ)/√5` family member). **TRANSCRIBE THE CIRCUIT
+FROM THE PUBLISHED PAPER** — do not reconstruct from memory or secondary sources — and
+record the figure/equation number in a code comment. Properties (assert, do not
+assume): success branch applies `V3` (non-Clifford) to `d` and exits; failure branch
+applies identity to `d` up to a known Pauli/Clifford correction (the body applies it
+before repeating), so the carried state at every iteration boundary equals `|ψ⟩`;
+per-attempt success probability (expected ≈ 5/8) measured at `lam=0` and **pinned
+against the paper's stated value**. Output: 3-basis tomography of `d` after the loop
+against the classically computed ideal `V3|ψ⟩`. Report the computed body depth `B`
+(do not force it); the published circuit is shallow with a small `n2q` (expected 2–4)
+— record the exact count and use it consistently in the cost-model parity check.
+
+**Configurations.**
+- **`rus_data` (faithful)** — the circuit as published, standard coherence fraction
+  `f`. Compute the window against the deployed calibration at build time; with `p≈5/8`,
+  `C_min≈4`. If `C_min > C_max` this is a **negative control** (strategy NONE) and the
+  fast config carries the knit result; if the window is already non-empty, **one config
+  suffices** and the fast config is dropped. Decide from the computed numbers.
+- **`rus_data_fast` (only if needed)** — raise `f` first (as in §6.3), before touching
+  anything about the circuit. **Never alter the published body to open the window.**
+
+Run both against the nominal calibration and the **elevated-leakage variant** (`1e-2`,
+§4.1): with only ~2% of shots reaching a cut, the gain is measurable only where the
+harvestable pool is large.
+
+**Expected pass behavior (assert, do not assume).** `class=carry` (single slot) in all
+configs; `known_state=unknown` (the non-Clifford preparation must defeat the tableau —
+anything else is a bug); **no refresh** anywhere; `strategy=knit` where the window is
+non-empty, `none` where it is not, with decision attributes emitted for audit either
+way. The **existing periodic knit rewrite is used as-is** — this benchmark needs *no*
+estimator or scheduling changes (independent of the §12 levers).
+
+**Evaluation.** Standard sweep (§8.3), arms **unbounded** and **knit**, fidelity against
+`V3|ψ⟩`, RMSE/depth columns as elsewhere, predicted↔measured at nominal noise for the
+selected strategy. Additionally report the **fraction of shots receiving ≥1 cut** and
+`E[#cuts]` — the thin `p≈5/8` tail is the explanation a reader needs for the gain's
+size. Leakage sweep {1e-4, 1e-3, 1e-2} via variant files, reporting the knit gain at
+each point; the claim under test is that the gain **scales with leakage**, not that it
+is large.
+
+**Acceptance.** (1) The expected-behavior assertions hold on the **real lowered IR** for
+every config. (2) The transcription gates (unitary + probability) pass. (3) Where knit
+fires, the elevated-leakage gain over unbounded is **positive with non-overlapping seed
+error bars** and **monotone** across the leakage sweep, while near-zero leakage makes it
+statistically indistinguishable from zero (the no-go, observed). (4) predicted↔measured
+within the **S3 0.02** criterion at nominal noise for the selected strategy. (5) The
+cut-fraction and `E[#cuts]` figures are reported alongside the gain, whatever its size —
+**no tuning toward a target**.
+
+**Out of scope.** Bocharov-style multi-stage ladders (separate benchmark if
+commissioned); changing the published circuit, its success probability, or the
+correction rule; multi-qubit data states; seepage; the γ=3 decomposition; the LRU
+scrub; the §12 knit levers (this benchmark lands against the current knit
+implementation).
+
+### 6.6 `rus_data` citations (verify before use)
+
+Both already in the bibliography; **verify page-level details** before any paper edit.
+
+- `paetznick2014rus` — the protocol itself, the identity-on-failure property, and the
+  published circuit this benchmark **transcribes**.
+- `bocharov2015rus` — the family context (efficient RUS synthesis), cited as the
+  generalization, **not run** here.
+
 ---
 
 ## 7. Unit tests (FileCheck / lit)
@@ -947,6 +1044,10 @@ Under `mlir/test/Quantum/Purl/`, run by lit / `check-dialects`:
   returns **`unknown`**; **no refresh rewrite** occurs.
 - `ipe_project_knit` (§6.3) — the fast-config shape receives the **knit** rewrite
   (guard, weight carry, `purl.qcut` with axis, expval legalization).
+- `rus_data_unknown` (§6.5) — the Paetznick–Svore `V3` body classifies **carry** and
+  returns **`unknown`** (non-Clifford data); **no refresh rewrite**.
+- `rus_data_knit` (§6.5) — the config with a non-empty window receives the **knit**
+  rewrite (guard, weight carry, `purl.qcut`, expval legalization).
 
 Each asserts the relevant `purl.*` attributes and, for rewrites, the transformed
 structure (carry extension, guard, cut expansion / reset+re-prep, output).
@@ -962,6 +1063,16 @@ Simulator/model gates for `pump` (in the §5 validation harness, not FileCheck):
 `lam=0` the mirror reproduces `<Z>=0.5` exactly; the pass's per-iteration `n2q = 6`
 matches the mirror's leakage charging (a one-iteration parity check); fixed seeds
 reproduce the run byte-for-byte.
+
+Simulator/model gates for `rus_data` (§5 validation harness, not FileCheck): a
+**transcription** gate — at `lam=0` the failure branch composed with its correction
+equals the identity on `d` over a basis of inputs, and the success branch equals `V3`
+up to global phase (this pins the transcription); a **probability** gate — the
+measured `lam=0` success probability matches the paper's stated value within
+statistical error; a **fidelity** gate — `lam=0` delivered fidelity is **1.0** within
+statistics against the fixed ideal `V3|ψ⟩` (no per-shot reference); a **parity** gate —
+the pass's `n2q` matches the mirror's per-iteration leakage charging; and a
+window-math unit test pinning empty/non-empty for both configs on the deployed calib.
 
 ---
 
@@ -1292,3 +1403,199 @@ The γ=3 classically-communicated wire-cut decomposition (not verified against t
 literature — do not implement or scaffold for it); the LRU-scrub strategy (separate
 spec if commissioned); any change to `V_max`, γ, or the qcut decomposition itself;
 multi-qubit carry; post-selection or shot discarding in any form.
+
+---
+
+## 13. Migrate strategy — swap-based carrier replacement (roadmap — not yet implemented)
+
+**Migrate is a new cut strategy for `unknown` carried states, and it changes the
+decision procedure.** Every `C` iterations the carried state is **SWAPped** onto a
+freshly-reset partner qubit and the old physical carrier is abandoned and reset off
+the critical path. The state moves **without being measured, re-prepared, or known**,
+and carrier-stuck leakage stays behind on the abandoned qubit — so it clears the
+reset-clearable error class **at γ=1** (no quasi-probability weights, no variance
+window), where knit needs γ²=16. It is the swap-based **leakage-reduction unit** of
+the fault-tolerance literature (Aliferis–Terhal; Suchara–Cross–Gambetta), built from
+**three CNOTs** on the standard gate set, so it needs no hardware LRU instruction.
+
+**Locked decisions (do not revisit).**
+1. **Migrate REPLACES knit** in the cost model for `unknown` states. The procedure
+   becomes: **proven → refresh**; **unknown → migrate** where it is cost-positive and
+   a partner exists; **else none**. The knit lowering, its FileCheck tests, and its
+   force flag are **KEPT** (the paper's no-go and comparison machinery), but the cost
+   model **never selects knit on its own**.
+2. **Ping-pong pair.** The carry alternates between **two fixed adjacent physical
+   qubits** chosen at compile time; the abandoned qubit is reset during the following
+   window, so a fresh partner is always ready. **One extra qubit total.**
+3. The SWAP lowers to **three CNOTs** on the pair's edge, each charged with that
+   edge's `gate_2q_err` and `leak_2q` in **both** the cost model and the simulator.
+   No native-SWAP shortcut, no ideal mode.
+4. A SWAP **from a leaked carrier does not transfer the state**: gates on a leaked
+   qubit are no-ops in the absorbing model (§5), so the new carrier ends in reset
+   `|0>` and the leak flag stays with the old physical qubit, cleared by its off-path
+   reset.
+5. **Leakage is first-class calibration data** (§4.1/§4.2, restated normatively
+   below). The `p-leak`/`--leak` knobs are **deleted everywhere**; the JSON is the
+   single source. Leakage is **absorbing** (no seepage) and charged **per two-qubit
+   gate**, never per idle-second, identically in the pass model and the simulator —
+   any asymmetry breaks S3 (predicted↔measured) by construction.
+
+### 13.1 Migrate semantics
+
+The pass fixes a partner qubit `k'` for the carried qubit `k` at compile time: among
+edges incident to `k` in the coupling map, the edge minimizing `3·(gate_2q_err +
+leak_2q)` (ties → lower index). **If `k` has no incident edge, migrate is
+unavailable.** Every `C` iterations, on the live carrier `q_live ∈ {k, k'}`:
+1. **SWAP** `q_live` with its partner (three CNOTs on the pair's edge);
+2. the partner becomes the live carrier; the old carrier is marked for reset, done by
+   the runtime during the next window, **off the loop's critical path**;
+3. **no measurement, no weights, no change to the expval lowering.**
+
+Coherence bookkeeping: the live wire's age resets at each migration (the new carrier
+is physically fresh; the state's transportable decoherence carries over, exactly as
+knit's semantics). The window constraint `C ≤ C_max` applies unchanged. **There is no
+`C_min`** (no variance floor).
+
+### 13.2 Cost model and decision procedure
+
+Per-migration charge on the selected edge (`g_e = gate_2q_err`, `l_e = leak_2q`):
+
+```
+eps_mig = 1 − (1 − g_e)^3 · (1 − lam·l_e)^3
+```
+
+Benefit per window: the leakage that would otherwise keep accumulating on the live
+wire. With per-iteration body charge `n2q·p_leak`, migration is **cost-positive** when
+the expected leakage cleared per window exceeds `eps_mig`; first-order admissibility
+(implement with the exact products):
+
+```
+C · n2q · p_leak  >  3·(g_e + l_e)     (evaluated at the candidate C)
+```
+
+Predicted fidelity: the non-transportable term becomes **per-window** rather than
+per-lifetime, `F1_nt = (1 − p_leak)^(n2q·s_win)` with `s_win` the mean age within a
+window (reuse the existing `sbar(C)` machinery), multiplied by
+`(1 − eps_mig)^(E[#migrations])`. `F1_t` is unchanged in form; the age entering it
+resets per window as for the other cut strategies. **Selection:** refresh if proven;
+else migrate at the arg-min `C ∈ [1, C_max]` if any `C` is cost-positive; else none.
+**Knit is selectable only via the existing force flag** (`C`/force path).
+
+### 13.3 IR changes
+
+The migrate rewrite mirrors the **refresh** rewrite's counter and guard. The `scf.if`
+body emits the three `quantum.custom "CNOT"` ops between the carried SSA value and the
+partner qubit value, threading **both** through the loop's `iter_args` (the partner
+enters the loop as a second carried value, initialized from a freshly allocated +
+reset qubit). Emitted attributes: `purl.strategy = "migrate"`, `purl.cut_period`,
+`purl.pair = [k, k']`, plus the existing decision-audit attributes. The abandoned
+qubit's reset is a `quantum.reset` on the swapped-out value **inside the same
+`scf.if`**, after the CNOTs (the simulator treats it as off-path, §5). Expval
+legalization is untouched — migrate produces an **unweighted** estimate.
+
+### 13.4 Calibration JSON schema (leakage — restated, normative)
+
+This restatement is normative; where it differs from §4.1/§4.2, this section wins.
+**Top-level, REQUIRED:** `leak_2q_default` (float [0,1], per-2q-gate leakage for any
+edge without its own value). **Per-edge, OPTIONAL:** `edges[k].leak_2q` (float [0,1],
+overrides the default for that edge). **Top-level, write-don't-validate:**
+`leak_source` (free provenance string — vendors do not publish leakage; files must say
+where the number came from). **Validation:** `leak_2q_default` present and in range
+else hard error naming this spec; every `leak_2q` in range else hard error; non-fatal
+warning if any `leak_2q` deviates >10× from the default (typo guard); unknown keys
+ignored. **Generator** (`ibm_dataset.build_json`): parameters `leak_2q_default`
+(suggested 1.0e-3) and `leak_spread` (fraction, default 0 → write only the default;
+nonzero → per-edge values via the same seeded scheme as `gate_2q_err`); write
+`leak_source`; regenerate `ibm_eagle_r3.json`.
+
+### 13.5 Simulator & pass consumption
+
+**Simulator:** `QSim` takes `p_leak` and the pair-edge parameters from the calib dict
+only — all constructor/CLI leak plumbing deleted. On each body 2q gate, mark the
+target leaked with prob `lam·p_leak`; on each of the three migration CNOTs, charge the
+pair edge's `gate_2q_err` and `lam·leak_2q` to the qubits involved; `lam=0` exactly
+noiseless. Leaked is absorbing: gates on a leaked qubit are no-ops, a leaked
+measurement returns the existing garbage convention, `reset` clears the flag,
+migration from a leaked carrier yields a live wire in `|0>` (decision 4) with the flag
+staying on the abandoned qubit until its reset. The abandoned reset is **free of loop
+latency** (not in `B`, not on the live wire's coherent-age clock) but must complete
+before that qubit is next used; the ping-pong period guarantees a full window.
+Sensitivity sweeps via `eval/variants.py` (variant JSONs), no knob returns.
+
+**Pass:** DELETE the `p-leak` option (unknown-option error; update the §3.0 glossary).
+`Calib::load` computes for carried qubit `k`: `p_leak` = global median of `leak_2q`
+over all edges (default where absent), **matching the Python loader exactly (parity
+test)**, plus the §13.1 pair selection with the chosen edge's `gate_2q_err`/`leak_2q`
+exposed to the cost model. The flat dict keeps the key `p_leak`. Cost model per §13.2,
+attributes per §13.3.
+
+### 13.6 Tests
+
+**Leakage (carried from the superseded knob-migration, all still required):** loader —
+missing `leak_2q_default` errors, out-of-range errors, per-edge override respected,
+median flatten correct, `leak_2q_default=0` reproduces the zero-leak numbers exactly
+(regression); generator determinism, `leak_spread=0` writes no per-edge fields;
+Python/C++ loader **parity** on one file (flatten + pair choice); end-to-end `rus` at
+`lam=1` matches the published numbers; removal — old `p-leak`/`--leak` command lines
+fail naming `leak_2q_default`. **New for migrate:** FileCheck `migrate_basic.mlir`
+(unknown carry → migrate rewrite: guard, three CNOTs, partner iter_arg, reset of the
+abandoned qubit, `purl.pair`); FileCheck `migrate_partner_choice.mlir` (two incident
+edges of different `leak_2q` → the cheaper edge chosen); ping-pong (forced migrate at
+`C=1` for 4 iterations alternates carriers `k,k',k,k'` via the sim carrier trace);
+leaked-transfer (force carrier leaked, migrate → live wire is `|0>`/unleaked, abandoned
+qubit holds the flag until reset); cost-model unit test pinning cost-positivity on both
+sides of the §13.2 threshold; decision procedure (proven→refresh; unknown+no edge→none;
+unknown+cost-positive→migrate; knit never selected without the force flag).
+
+### 13.7 Evaluation
+
+**Regression:** full refresh sweeps of `rus`/`ipe`, byte-identical (fixed seeds).
+**Migrate headline:** `ipe_project` (both configs) and `rus_data` under the new
+procedure, standard sweep (§8.3), nominal + elevated-leakage (`1e-2`) variants, arms
+**unbounded** and **migrate**; report fidelity, RMSE, depth, `E[#migrations]`,
+predicted↔measured. Note the qualitative change: the faithful `ipe_project` config
+(previously NONE because knit's window was empty) is expected to become
+**migrate-eligible** since migrate has no variance floor — assert whatever the cost
+model decides and report it. **Zero-leakage ablation** on one migrate benchmark:
+leakage-zero reduces migrate's benefit to age-capping alone; the gap to nominal is the
+measured leakage-clearing component. **Force-knit comparison** on `ipe_project_fast` at
+elevated leakage: migrate vs forced-knit at their best `C`, showing the **same cleared
+error class at γ=1 vs γ²=16** — the paper's central migrate figure.
+
+### 13.8 Effects on companion specs
+
+- **§4.1/§4.2 (leakage schema)** — superseded by §13.4 where they differ.
+- **§6.3 `ipe_project`** — expected strategies change from {none, knit} to what the new
+  procedure decides ({migrate or none, migrate}); the **falsification arm** (forced
+  refresh collapses fidelity) is unchanged and still required; its knit FileCheck moves
+  to the force flag.
+- **§6.5 `rus_data`** — same substitution; the benchmark's purpose (unknown by the
+  protocol's own premise) is unaffected.
+- **§12 knit levers** — unaffected in content but the levers now apply only to
+  **force-knit** experiments; do **not** schedule §12 ahead of this section.
+
+### 13.9 Acceptance criteria
+
+(1) All §13.6 tests green, incl. both parity/regression gates and the published-numbers
+reproduction. (2) `grep -r "p-leak\|--leak"` finds no live option plumbing (the flat
+key `p_leak` remains). (3) Migrate fires on **≥1 config where knit was inadmissible**,
+with positive elevated-leakage gain over unbounded (**non-overlapping seed error
+bars**) and near-zero gain at zero leakage beyond age-capping. (4) predicted↔measured
+within **0.02** at nominal noise for every selected strategy. (5) The force-knit
+comparison shows migrate **matching or exceeding** knit's fidelity at equal or lower
+shot count.
+
+### 13.10 Citations (verify before use)
+
+- Aliferis, Terhal. *Fault-tolerant quantum computation for local leakage faults.*
+  Quantum Inf. Comput. **7**, 139 (2007). — leakage-reduction units from standard
+  operations.
+- Suchara, Cross, Gambetta. *Leakage suppression in the toric code.* Quantum Inf.
+  Comput. **15**, 997 (2015). — swap-based LRU analysis, the exact construction migrate
+  uses.
+
+### 13.11 Out of scope
+
+Seepage (L2), per-qubit or idle-time leakage, leakage spread to gate partners, native
+SWAP or hardware LRU instructions, pools of spares or per-cut partner re-selection,
+changes to refresh or to the knit lowering itself, the γ=3 decomposition.
