@@ -8,10 +8,15 @@ delivered-state fidelity that unbounded holding loses to decoherence.
 Purl has two halves that share **one real-hardware calibration JSON**:
 
 1. **An MLIR compiler pass** (`--purl` + `--purl-lower-qcut`) in the Catalyst tree
-   that classifies the loop, proves the carried state, selects a cut strategy, and
-   rewrites the loop via an abstract `purl.qcut` op.
+   that classifies the loop, proves the carried state, selects a **cut strategy**, and
+   rewrites the loop (via an abstract `purl.renew` op, or a direct SWAP for migrate).
 2. **A pure-NumPy noise simulator + eval harness** (this directory) that measures
    delivered fidelity on the *same* JSON, cross-validating the pass's prediction.
+
+**Cut strategies** (see §5.1): `refresh` (γ=1, proven-known state → re-prepare it),
+`knit` (γ²=16 quasi-probability, unknown state, kept as a comparison arm), `migrate`
+(γ=1, unknown state → SWAP onto a fresh partner; the cost model's default for unknown
+states), or `none`.
 
 The full design is in [`doc/specs/PURL_SPEC.md`](../../doc/specs/PURL_SPEC.md).
 
@@ -26,10 +31,16 @@ mlir/test/Quantum/Purl/             # FileCheck / lit tests
 frontend/catalyst/passes/           # the @qjit decorators (purl, purl_lower_qcut)
 mlir/purl/                          # THIS package — simulator + benchmarks + eval
   sim/        qsim.py knit_runtime.py fast_target.py ibm_dataset.py validate.py
-  benchmarks/ rus_rx_ibm.py rus_lowp.py rus_chain.py ibm_eagle_r3.json
-  eval/       experiment.py run_eval.py plots.py ...
-  results/    experiment.csv (+ figures)
+  benchmarks/ rus_rx_ibm.py rus_lowp.py rus_chain.py            # RUS family
+              pump.py ipe_project.py rus_data.py qwalk.py       # newer benchmarks
+              ibm_eagle_r3.json                                 # the shared calibration
+  eval/       experiment.py run_eval.py variants.py plots.py    # headline + sweeps
+              ipe_project.py rus_data.py migrate.py qwalk.py     # per-benchmark evals
+  results/    experiment.csv, <benchmark>.txt (+ figures)
 ```
+
+`sim/validate.py` is the single gate suite for the simulator + every benchmark; run
+it after any simulator change.
 
 ---
 
@@ -77,8 +88,9 @@ rebuild `catalyst-cli` after any pass change.
 
 ### 3a. On MLIR directly (`quantum-opt`)
 
-`--purl` runs the analysis + rewrite (emits `purl.qcut`); `--purl-lower-qcut`
-expands it into concrete ops. Run them in sequence:
+`--purl` runs the analysis + rewrite (refresh/knit emit `purl.renew`; migrate emits a
+SWAP directly); `--purl-lower-qcut` expands `purl.renew` into concrete ops. Run them
+in sequence:
 
 ```bash
 mlir/build/bin/quantum-opt \
@@ -87,8 +99,13 @@ mlir/build/bin/quantum-opt \
 ```
 
 Use `--purl="... analyze-only=true"` to emit the `purl.*` analysis attributes
-(`purl.class`, `purl.known_state`, `purl.strategy`, `purl.window`,
+(`purl.class`, `purl.known_state`, `purl.strategy`, `purl.window`, `purl.pair`,
 `purl.predicted_fidelity`, …) **without** rewriting. Full option glossary: spec §3.0.
+
+Notable options: `force-knit=true` selects knit for an unknown state (the paper's
+comparison arm) instead of the default migrate; `age-trigger=true` searches a first-cut
+threshold for knit (spec §12). **Leakage is calibration data now** — it lives in the
+JSON (`leak_2q_default` / per-edge `leak_2q`), not a `--leak`/`p-leak` knob.
 
 ### 3b. Inside a `@qjit` program
 
@@ -114,9 +131,10 @@ def rus():
 print(rus())   # compiles + runs; Purl cuts the held wire when profitable
 ```
 
-`purl(...)` accepts `calib, p, shots, margin, sigma0, C, f, depth` (the
-placement/hardware knobs `carry-qubit` / `p-leak` go via
-`catalyst.passes.apply_pass("purl", **{"carry-qubit": 3})`).
+`purl(...)` accepts `calib, p, shots, margin, sigma0, C, f, depth` (the placement knob
+`carry-qubit` and flags like `force-knit` go via
+`catalyst.passes.apply_pass("purl", **{"carry-qubit": 3})`). Leakage comes from the
+calibration JSON, not a knob.
 
 ---
 
@@ -127,7 +145,9 @@ All eval commands run from **this directory** (`mlir/purl/`) with `PYTHONPATH=.`
 ### 4a. The main comparison table — `eval/experiment.py`
 
 Sweeps a noise scale `lam` and reports delivered Bloch fidelity for the
-**unbounded**, **refresh (γ=1)**, and **knit (γ=4)** arms.
+**unbounded**, **refresh (γ=1)**, and **knit (γ=4)** arms, plus the coherent-depth,
+RMSE, and decision columns. It also prints a **`pass strategy:`** line — the strategy
+the cost model would select for that benchmark (refresh / migrate / none).
 
 ```bash
 # rus_lowp on real IBM Eagle r3 data (the headline heavy-tail case)
@@ -141,14 +161,27 @@ Options:
 
 | flag | default | meaning |
 |---|---|---|
-| `--bench {rus_rx_ibm,rus_lowp}` | `rus_rx_ibm` | which benchmark |
+| `--bench {rus_rx_ibm,rus_lowp,ipe,pump}` | `rus_rx_ibm` | which benchmark |
 | `--ibm` | off | use the real IBM Eagle r3 per-qubit dataset (else a synthetic calib) |
+| `--ibm-json PATH` | bundled | calibration JSON (use `eval/variants.py` for leakage sweeps) |
 | `--carry-qubit N` | `0` | which physical qubit the carried wire maps to (`--ibm`) |
-| `--leak X` | published est. | per-2q-gate leakage probability on the carried qubit (`--ibm`) |
 | `-S S` | `6000` | total shots per fidelity point |
 | `--seeds K` | `8` | independent seeds (the ± is the seed-std) |
 
-Output goes to the console (table + legend) and `results/experiment.csv`.
+Leakage is no longer a CLI flag — it is the `leak_2q_default` key in the JSON; sweep it
+with `eval/variants.py` (writes variant calibration files). Output goes to the console
+(table + legend) and `results/experiment.csv`.
+
+### 4a′. Per-benchmark evals (the newer benchmarks + strategies)
+
+Each writes a same-named `results/<name>.txt`. Run from `mlir/purl/` with `PYTHONPATH=.`:
+
+| script | benchmark | what it shows |
+|---|---|---|
+| `eval/ipe_project.py` | `ipe_project` | knit-only projection; leakage ablation + a refresh **falsification** arm |
+| `eval/rus_data.py` | `rus_data` | RUS `V3` on data; noise sweep + leakage sweep |
+| `eval/migrate.py` | `rus_data` | unbounded vs knit vs **migrate** (γ=1 vs γ²=16) |
+| `eval/qwalk.py` | `qwalk` | fat-tailed migrate headline; `--leak-sweep` for the gain-vs-leakage table |
 
 ### 4b. The full sweep set — `eval/run_eval.py`
 
@@ -170,8 +203,11 @@ PYTHONPATH=. python3 sim/ibm_dataset.py          # (re)writes benchmarks/ibm_eag
 
 ### 4d. Validation gates — `sim/validate.py`
 
-Checks the noiseless (`lam=0`) benchmark reproduces its ideal ⟨Z⟩ and the idle
-|+⟩-over-T2 coherence gate. Run this first if you change the simulator.
+One suite of gates for the simulator **and every benchmark**: the noiseless (`lam=0`)
+⟨Z⟩ + idle-|+⟩-over-T2 coherence gates, the leakage-schema loader, and a per-benchmark
+gate for `pump`, `ipe_project`, `rus_data`, `qwalk`, plus the migrate-strategy
+semantics (ping-pong, leaked-transfer, cost threshold). Run it first if you change the
+simulator.
 
 ```bash
 PYTHONPATH=. python3 sim/validate.py
@@ -193,11 +229,30 @@ rus_lowp[p=0.1,Cr=2,B=12] | 1.00 | 12  1  9.93  94  119         |     0.9017    
   better), mean ± seed-std.
 - **arms** — `unbounded` (no cutting), `refresh(g1)` (deterministic γ=1 cut of a
   proven state, zero variance), `knit(g4)` (general γ²=16 quasi cut; shown `n/a`
-  where its variance window is empty).
+  where its variance window is empty). The per-benchmark evals (§4a′) add a
+  **`migrate(g=1)`** arm for unknown states.
 
 Refresh beating unbounded (non-overlapping bars), with the gap growing in `lam`, is
 the target result (spec S2). The header line also reports the refresh C-sweep and
 whether the pass window brackets the empirical best `C*` (spec S4).
+
+### 5.1 Strategies and benchmarks
+
+| strategy | γ | carried state | cut action |
+|---|---|---|---|
+| `refresh` | 1 | proven known | measure + reset + re-prepare the known state (`purl.renew`) |
+| `knit` | 4 (γ²=16) | unknown (comparison arm / `force-knit`) | quasi-probability wire cut, threads a signed weight (`purl.renew`) |
+| `migrate` | 1 | unknown (cost-model default, spec §13) | SWAP the state onto a fresh partner (3 CNOTs) + reset the abandoned wire; `purl.pair` |
+| `none` | — | any | not profitable → loop unchanged |
+
+| benchmark | shape | expected strategy |
+|---|---|---|
+| `rus_rx_ibm` / `rus_chain` | Toffoli-coin RUS, unknown | none / migrate |
+| `rus_lowp` | CNOT-heralded, identity | **refresh** (heavy-tail headline) |
+| `pump` | 3× CNOT-sandwich, identity, 6 2q gates/iter | **refresh** (leakage-heavy) |
+| `ipe_project` | controlled-Rz projection, unknown | none / knit / migrate |
+| `rus_data` | Paetznick–Svore `V3` RUS on data, unknown | knit / migrate |
+| `qwalk` | fat-tailed random-walk herald, 2q-heavy, unknown | **migrate** (the headline migrate win) |
 
 ---
 
@@ -247,8 +302,12 @@ whether the coin entangles the target.
    - add `"<name>"` to the `--bench` `choices`;
    - add an `import benchmarks.<name> as bench` branch in `main`;
    - add `"<name>": <layers>` to `B_LAYERS`;
-   - set the `touch` flag if your coin entangles the target
-     (`touch = args.bench in ("rus_lowp", "<name>")`).
+   - add `"<name>": <n2q>` to `N2Q_PER_ITER` (per-iteration 2q-gate count on the held
+     wire — 0 = idle target, 1 = a single touch, 6 = pump/qwalk-style; drives leakage).
+
+   For an unknown-state or bespoke benchmark, a **dedicated eval** (like
+   `eval/ipe_project.py` / `eval/rus_data.py` / `eval/qwalk.py`) is usually cleaner
+   than the shared `experiment.py` fast path — copy the closest one.
 
 3. **If the carried state ≠ `H T H T H |0>`**, also update the ideal target used by
    the fast executors: `IDEAL_BLOCH` in `eval/experiment.py` and `_prep_psi0` in
@@ -269,7 +328,8 @@ whether the coin entangles the target.
 ## 8. Further reading
 
 - [`doc/specs/PURL_SPEC.md`](../../doc/specs/PURL_SPEC.md) — full specification
-  (classification, known-state proof, cost model, the `purl.qcut` op + lowering,
-  the shared JSON schema, success criteria, and the honest physics findings).
+  (classification, known-state proof, cost model, the strategies, the `purl.renew` op
+  + lowering, the migrate strategy §13, the shared JSON leakage schema, success
+  criteria, and the honest physics findings).
 - `sim/qsim.py` — the trajectory simulator and its noise model.
 - `mlir/lib/Purl/Transforms/Purl.cpp` / `LowerQCut.cpp` — the two passes.
