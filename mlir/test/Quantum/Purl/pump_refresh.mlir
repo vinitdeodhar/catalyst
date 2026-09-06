@@ -22,7 +22,7 @@
 // CHECK: quantum.measure
 // every C failing iterations: a deterministic refresh cut re-preparing the known state
 // CHECK: scf.if
-// CHECK: purl.qcut
+// CHECK: purl.renew
 // CHECK-SAME: strategy = #purl<strategy refresh>
 // CHECK: quantum.custom "T"
 // CHECK: purl.yield

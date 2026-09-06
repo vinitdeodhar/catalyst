@@ -16,7 +16,7 @@
 // CHECK: purl.known_state = "none"
 // never a refresh: the carried state is not provably fixed
 // CHECK-NOT: strategy = #purl<strategy refresh>
-// CHECK-NOT: purl.qcut
+// CHECK-NOT: purl.renew
 
 func.func @ipe_project() -> f64 {
   %true = arith.constant true

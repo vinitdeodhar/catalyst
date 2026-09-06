@@ -1,7 +1,7 @@
 // rus_data (spec 6.5): the knit rewrite on the Paetznick-Svore V3 RUS body. At
 // p=5/8 on a unit-coherence calibration the window is non-empty (C_min=3), so the
 // KNIT arm fires: the carry gains an i32 cut counter + f64 quasi-probability weight,
-// a purl.qcut (strategy knit) every C failing iterations, and the expval is legalized
+// a purl.renew (strategy knit) every C failing iterations, and the expval is legalized
 // to the weighted sample. The carried data state is UNKNOWN (non-Clifford), so knit
 // -- unbiased for ANY state -- is the only valid cut; refresh never appears.
 // RUN: quantum-opt --purl="calib=unit p=0.625" %s | FileCheck %s
@@ -18,7 +18,7 @@
 // CHECK: quantum.measure
 // every C failing iterations: a quasi-probability knit cut threading the weight
 // CHECK: scf.if
-// CHECK: purl.qcut
+// CHECK: purl.renew
 // CHECK-SAME: strategy = #purl<strategy knit>
 // unknown carried state -> knit, quasiprobability cut
 // CHECK: purl.cut = "quasiprobability"

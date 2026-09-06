@@ -19,11 +19,11 @@ include "mlir/Pass/PassBase.td"
 
 def PurlPass : Pass<"purl"> {
     let summary = "Detect carry-type dynamic loops, select a cut strategy from the "
-                  "hardware cost model, and emit an abstract purl.qcut at each cut site.";
+                  "hardware cost model, and emit an abstract purl.renew at each cut site.";
     let description = [{
         The analysis + rewrite half of Purl (spec 3). Classifies the loop, computes
         body depth, proves the carried state (for refresh), runs the profitability
-        cost model, and -- when profitable -- emits a single purl.qcut op inside the
+        cost model, and -- when profitable -- emits a single purl.renew op inside the
         periodic cut guard with the chosen strategy baked in. Emits purl.* attributes
         (class, window, known_state, strategy, C, predicted, predicted_fidelity).
     }];
@@ -65,10 +65,10 @@ def PurlPass : Pass<"purl"> {
 }
 
 def LowerQCutPass : Pass<"purl-lower-qcut"> {
-    let summary = "Mechanically expand each purl.qcut into its concrete op sequence.";
+    let summary = "Mechanically expand each purl.renew into its concrete op sequence.";
     let description = [{
         The code-generation half of Purl (spec 3.7). A purely mechanical rewrite that
-        switches on purl.qcut's `strategy`: `refresh` -> measure + reset + inline the
+        switches on purl.renew's `strategy`: `refresh` -> measure + reset + inline the
         `prep` region (+ pauli_correction); `knit` -> sample-term RNG hook + basis
         change to `axis` + measure + reset + eigenstate prep + 4*sigma*s weight fold.
         Performs NO analysis; reads only the op.

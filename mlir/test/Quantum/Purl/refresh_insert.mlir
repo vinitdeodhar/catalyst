@@ -3,7 +3,7 @@
 // Held-memory carry loop: the carried wire holds |psi0> = H T H T H |0> while a
 // coin ancilla retries; the body NEVER touches the carried wire, so its failure
 // action is provably the identity. --purl proves it (purl.known_state="identity")
-// and emits a REFRESH purl.qcut inside the periodic cut guard -- NOT an inline
+// and emits a REFRESH purl.renew inside the periodic cut guard -- NOT an inline
 // expansion. The carry gains an i32 counter only (no f64 weight), there is no
 // sample fn, and the quantum.expval output survives.
 
@@ -12,7 +12,7 @@
 // CHECK: scf.while ({{.*}}) : (i1, !quantum.bit, i32) -> (i1, !quantum.bit, i32)
 // CHECK: scf.if
 // the abstract cut op, refresh strategy, with its |psi0> prep region (H T H T H)
-// CHECK: purl.qcut
+// CHECK: purl.renew
 // CHECK-SAME: strategy = #purl<strategy refresh>
 // CHECK: quantum.custom "Hadamard"
 // CHECK: quantum.custom "T"

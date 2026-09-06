@@ -145,10 +145,10 @@ Purl is split into **two passes** so analysis and code-generation never mix:
 - **`--purl`** — the analysis + rewrite pass. It runs *all* of 3.1–3.6 (classify,
   depth, window, known-state proof, cost model, fidelity prediction) and **decides
   everything**; at each chosen cut site it emits a single high-level
-  **`purl.qcut`** op (3.7) with every decision baked into it. Options: see the
+  **`purl.renew`** op (3.7) with every decision baked into it. Options: see the
   glossary in 3.0.
 - **`--purl-lower-qcut`** — a purely **mechanical** lowering (3.7) that expands
-  each `purl.qcut` into its concrete op sequence. It performs **no** analysis
+  each `purl.renew` into its concrete op sequence. It performs **no** analysis
   (no proof, no cost model) and reads only the op's own operands, attributes, and
   `prep` region.
 
@@ -160,7 +160,7 @@ register-threaded qubits). The rewrite (3.5) fires on carry loops with an
 ### 3.0 `--purl` options (glossary)
 
 All options live on `--purl`; `--purl-lower-qcut` takes none (every decision they
-influence is baked into the `purl.qcut` op). Four provenance classes:
+influence is baked into the `purl.renew` op). Four provenance classes:
 **hardware** (device properties, from the calibration dataset), **placement** (the
 logical→physical wire binding, from mapping/routing — a *selector* into the
 hardware data, not a property), **compiler knobs** (genuine tuning), and **profile
@@ -290,13 +290,13 @@ the observable), so it is deliberately excluded rather than compared. Refresh
 delivers the *same* computation at higher fidelity — that equivalence is the claim
 under test, and a discard arm would not be answering the same question.
 
-Both rewrites *insert a `purl.qcut` op* (3.7) rather than expanding a cut
+Both rewrites *insert a `purl.renew` op* (3.7) rather than expanding a cut
 inline — `--purl` builds the carry surgery + guard and bakes the strategy into the
 op; `--purl-lower-qcut` produces the actual op sequence.
 
 **REFRESH (gamma=1)** — fires when `known_state ∈ {identity, pauli}`: extend the
 carry with an `i32` counter and, every C failing iterations, emit
-`purl.qcut {strategy="refresh"}` carrying the known-`|psi0>` `prep` region (and,
+`purl.renew {strategy="refresh"}` carrying the known-`|psi0>` `prep` region (and,
 for a KnownPauli, the counter-parity `pauli_correction`). No weight, no RNG hook,
 zero variance; the **`quantum.expval` output survives** (a refresh delivers a
 genuine quantum state — no legalization). This is the only strategy that escapes
@@ -304,7 +304,7 @@ the Markovian no-go (it replaces the noisy state with the ideal one).
 
 **KNIT (gamma=4)** — the general quasi-probability cut: extend the carry with an
 `i32` counter + `f64` weight and, every C failing iterations, emit
-`purl.qcut {strategy="knit", axis=…}` threading the weight; legalize the
+`purl.renew {strategy="knit", axis=…}` threading the weight; legalize the
 `expval` output to a weighted Z sample. Idempotent (`purl.applied`). Its lowering
 (3.7) performs the `func.call @purl_sample_term` RNG hook → basis change → measure
 → reset → eigenstate prep → `4·sigma·s` weight fold.
@@ -389,24 +389,27 @@ dominates is set by `n1q,n2q` vs `(B+tau)/T2`: a *held-idle* wire (`n ≈ 0`) is
 the time source (the coherence budget) and its floor `C_min` from the count source
 (the sampling variance).
 
-### 3.7 The `purl.qcut` op and its mechanical lowering
+### 3.7 The `purl.renew` op and its mechanical lowering
 
 `--purl` never expands a cut inline. At each guarded cut site it emits one op from
-a small **Purl-owned dialect** (`purl.qcut`) that names the cut abstractly. (The op
-lives in its own dialect rather than the core `quantum` dialect so the transform is
-self-contained; it reuses quantum-dialect value types — `!quantum.bit` — and the
-`quantum` observable attribute for its `axis`.)
+a small **Purl-owned dialect** (`purl.renew`, formerly `purl.qcut`) that names the
+cut abstractly. (The op lives in its own dialect rather than the core `quantum`
+dialect so the transform is self-contained; it reuses quantum-dialect value types —
+`!quantum.bit` — and the `quantum` observable attribute for its `axis`.) The lowering
+pass keeps its name, **`--purl-lower-qcut`**. Only the **refresh** and **knit**
+strategies use `purl.renew`; **migrate** (§13) is not quasi-probability and emits its
+three-CNOT SWAP + reset directly (no `purl.renew` op).
 
 ```mlir
 // KNIT: threads the accumulated quasi-probability weight
-%q', %w' = purl.qcut %q, %w_in
+%q', %w' = purl.renew %q, %w_in
              { strategy = "knit", axis = #quantum<named_observable PauliZ> }
              prep { ^bb0(%fresh: !quantum.bit):     // eigenstate prep is axis-driven
                     quantum.yield %fresh : !quantum.bit }
            : (!quantum.bit, f64) -> (!quantum.bit, f64)
 
 // REFRESH: no weight; prep region reproduces the loop's input |psi0>
-%q' = purl.qcut %q
+%q' = purl.renew %q
         { strategy = "refresh", pauli_correction = #purl<pauli none> }
         prep { ^bb0(%fresh: !quantum.bit): /* input prep */ 
                quantum.yield %prepared : !quantum.bit }
@@ -420,7 +423,7 @@ captured `prep` region (the loop's input prep of `|psi0>` from a fresh `|0>`). A
 the `strategy`/`pauli_correction` attributes are **purl-dialect** attributes while
 `axis` reuses the `quantum` observable attribute (`#quantum<named_observable …>`);
 the op carries `!quantum.bit` operands/results. The
-counter/weight carry surgery and the `if counter == C { qcut }` guard are also
+counter/weight carry surgery and the `if counter == C { renew }` guard are also
 built by `--purl` (which alone knows `strategy` and `C`); the op sits inside that
 guard. Verifier: `refresh` takes/returns one qubit and no weight; `knit` takes/
 returns a qubit and an `f64` weight.
@@ -435,7 +438,7 @@ and needs nothing beyond the op itself:
 Running `--purl-lower-qcut` immediately after `--purl` reproduces the same lowered
 program the monolithic inline rewrite would have emitted: the two-phase split is an
 internal refactor with no change to the final IR, while giving a stable,
-inspectable `purl.qcut` level in between (useful for `--analyze-only` dumps and
+inspectable `purl.renew` level in between (useful for `--analyze-only` dumps and
 for testing insertion and expansion independently, §7).
 
 **Worked example (REFRESH).** Simplified IR — real Catalyst IR wraps classical
@@ -465,7 +468,7 @@ func.func @rus() -> f64 {
 
 *(b) After `--purl` (= input to `--purl-lower-qcut`).* An `i32` counter is threaded
 through the carry; the failing branch gets an `if counter==C` guard holding one
-self-contained `purl.qcut`. Analyses land as `purl.*` attributes.
+self-contained `purl.renew`. Analyses land as `purl.*` attributes.
 
 ```mlir
 func.func @rus() -> f64
@@ -487,7 +490,7 @@ func.func @rus() -> f64
     %ctr1 = arith.addi %ctr, %c1 : i32
     %hit  = arith.cmpi eq, %ctr1, %cC : i32
     %qn, %ctrn = scf.if %hit -> (!quantum.bit, i32) {
-      %qr = purl.qcut %q { strategy = "refresh" }
+      %qr = purl.renew %q { strategy = "refresh" }
               prep { ^bb0(%fresh: !quantum.bit):    // reproduces |psi0>
                      %p = ... ; quantum.yield %p : !quantum.bit }
             : (!quantum.bit) -> !quantum.bit
@@ -503,14 +506,14 @@ func.func @rus() -> f64
 }
 ```
 
-*(c) After `--purl-lower-qcut`.* The `purl.qcut` is mechanically expanded to
+*(c) After `--purl-lower-qcut`.* The `purl.renew` is mechanically expanded to
 measure + reset + inline the `prep` region (γ=1; the measured value is discarded —
 the noisy state is thrown away and the ideal `|psi0>` re-prepared). Only the guarded
 `scf.if` changes; everything else is byte-identical to (b).
 
 ```mlir
     %qn, %ctrn = scf.if %hit -> (!quantum.bit, i32) {
-      // purl.qcut{refresh} expands to: measure (discard) -> reset -> inline prep
+      // purl.renew{refresh} expands to: measure (discard) -> reset -> inline prep
       %m2, %qm = quantum.measure %q : i1, !quantum.bit
       %qz = scf.if %m2 -> (!quantum.bit) {          // conditional-X reset -> |0>
         %x = quantum.custom "PauliX"() %qm : !quantum.bit
@@ -1043,11 +1046,11 @@ Under `mlir/test/Quantum/Purl/`, run by lit / `check-dialects`:
 - `ipe_project_unknown` (§6.3) — the controlled-`Rz` body classifies **carry** and
   returns **`unknown`**; **no refresh rewrite** occurs.
 - `ipe_project_knit` (§6.3) — the fast-config shape receives the **knit** rewrite
-  (guard, weight carry, `purl.qcut` with axis, expval legalization).
+  (guard, weight carry, `purl.renew` with axis, expval legalization).
 - `rus_data_unknown` (§6.5) — the Paetznick–Svore `V3` body classifies **carry** and
   returns **`unknown`** (non-Clifford data); **no refresh rewrite**.
 - `rus_data_knit` (§6.5) — the config with a non-empty window receives the **knit**
-  rewrite (guard, weight carry, `purl.qcut`, expval legalization).
+  rewrite (guard, weight carry, `purl.renew`, expval legalization).
 
 Each asserts the relevant `purl.*` attributes and, for rewrites, the transformed
 structure (carry extension, guard, cut expansion / reset+re-prep, output).
@@ -1133,7 +1136,7 @@ that estimate is the bottom line.
 - `bounded_cap = C·B` — the compile-time coherent-depth **cap** the cut guarantees
   (the core structural result, independent of any noise model).
 - `E[#cuts] = q/(1−q)` — expected cuts per shot (extra measure + reset + feedback).
-- `added_ops` — ops the rewrite inserts (counter/guard/qcut); a compile-time (IR)
+- `added_ops` — ops the rewrite inserts (counter/guard/renew); a compile-time (IR)
   quantity, measured by diffing op counts before/after `--purl`.
 
 **4. Decision quality** (grading the §3.5 cost model, not one arm).
@@ -1201,7 +1204,7 @@ placement (Purl changes the circuit, §3.0 note).
 
 **Output side — compiling the transformed IR (the real work, largely out of scope
 per §9):**
-1. **Purl dialect (`purl.qcut`) + `--purl-lower-qcut`** — a small self-contained
+1. **Purl dialect (`purl.renew`) + `--purl-lower-qcut`** — a small self-contained
    dialect and its lowering pass (§3.7). Additive; no change to the core `quantum`
    dialect (it reuses `!quantum.bit` and the quantum observable attr).
 2. **Reset** — refresh needs measure→|0>; no native `quantum.reset`, so expand as
@@ -1232,10 +1235,10 @@ per §9):**
 ```
 purl/
   pass/            # Purl MLIR passes (in the Catalyst tree)
-    Purl.cpp          # --purl: analysis + rewrite; emits purl.qcut
-    LowerQCut.cpp     # --purl-lower-qcut: mechanical expansion of purl.qcut
+    Purl.cpp          # --purl: analysis + rewrite; emits purl.renew
+    LowerQCut.cpp     # --purl-lower-qcut: mechanical expansion of purl.renew
     PurlDialect.td    # the Purl-owned dialect
-    PurlOps.td        # the purl.qcut op definition (+ purl attrs)
+    PurlOps.td        # the purl.renew op definition (+ purl attrs)
     tests/*.mlir      # FileCheck tests (§7): insertion and lowering, run by lit
   sim/             # NumPy simulator (reads the shared JSON)
     qsim.py  knit_runtime.py  fast_target.py  ibm_dataset.py  validate.py
@@ -1323,7 +1326,7 @@ over the grid `A ∈ [1, C_max]`, `C ∈ [C_min_cond, C_max]` (`C_min_cond` = sm
 repeating — one shared derivation comment referencing this section; the periodic
 special case must stay **byte-identical** (FileCheck-pinned). **IR:** the knit guard
 becomes `counter >= A and (counter - A) mod C == 0`, and the emitted attributes gain
-`purl.cut_threshold = A` alongside `purl.cut_period = C`; the qcut region, weight
+`purl.cut_threshold = A` alongside `purl.cut_period = C`; the renew region, weight
 threading, and expval legalization are untouched.
 
 ### 12.2 Lever B — leakage-aware cut readout (simulator + one calib field)

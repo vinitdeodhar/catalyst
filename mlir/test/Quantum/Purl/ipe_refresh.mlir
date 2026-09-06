@@ -5,12 +5,12 @@
 // phase bits until confident. The controlled-U^k is net-identity on the eigenstate
 // (phase kickback onto the ancilla), so wire 0 is a held CARRY; wire 1 is the IPE
 // ancilla. --purl proves the held eigenstate (known_state = identity, prep = a
-// single Hadamard for |+>) and emits a REFRESH purl.qcut on the register slot.
+// single Hadamard for |+>) and emits a REFRESH purl.renew on the register slot.
 
 // CHECK: scf.while ({{.*}}) : (tensor<i1>, !quantum.reg, i32) -> (!quantum.reg, i32)
 // CHECK: scf.if
 // CHECK: quantum.extract %{{[0-9]+}}[ 0]
-// CHECK: purl.qcut
+// CHECK: purl.renew
 // CHECK-SAME: strategy = #purl<strategy refresh>
 // the prep region re-prepares |+> = H|0>
 // CHECK: quantum.custom "Hadamard"

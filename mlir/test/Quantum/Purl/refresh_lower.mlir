@@ -1,11 +1,11 @@
 // RUN: quantum-opt --purl="calib=unit p=0.625 C=3" --purl-lower-qcut %s | FileCheck %s
 //
-// Two-phase pipeline: --purl inserts a REFRESH purl.qcut, then --purl-lower-qcut
-// mechanically expands it. After lowering there is NO purl.qcut left; the cut has
+// Two-phase pipeline: --purl inserts a REFRESH purl.renew, then --purl-lower-qcut
+// mechanically expands it. After lowering there is NO purl.renew left; the cut has
 // become measure (end segment) + conditional-X reset + the inlined |psi0> prep
 // (H T H T H). No sample fn (refresh is weight-free). expval survives.
 
-// CHECK-NOT: purl.qcut
+// CHECK-NOT: purl.renew
 // CHECK-NOT: @purl_sample_term
 // CHECK: scf.if
 // expanded: measure, reset, re-prepare |psi0>

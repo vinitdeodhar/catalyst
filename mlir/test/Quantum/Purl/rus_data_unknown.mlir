@@ -12,7 +12,7 @@
 // CHECK: purl.known_state = "none"
 // never a refresh: a non-Clifford data state cannot be certified / re-prepared
 // CHECK-NOT: strategy = #purl<strategy refresh>
-// CHECK-NOT: purl.qcut
+// CHECK-NOT: purl.renew
 
 func.func @rus_data() -> f64 {
   %true = arith.constant true

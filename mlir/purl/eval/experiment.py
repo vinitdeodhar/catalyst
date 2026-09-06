@@ -173,6 +173,20 @@ def main():
           f"readout={calib['readout']*1e9:.0f}ns  2q_err={calib['p2']:.1e}  "
           f"p_leak/2q={calib.get('p_leak', 0):.1e}  B={B} layers/body   "
           f"window=[{C_min},{C_max}]")
+
+    # the strategy the pass's cost model selects (spec 3.5 / 13.2): PROVEN carried
+    # state -> refresh; UNKNOWN -> migrate where a cheap partner edge is cost-positive,
+    # else none (knit only via force-knit). rus_lowp/ipe/pump hold a provable state;
+    # rus_rx_ibm's coin is non-Clifford (unknown).
+    PROVEN = {"rus_lowp": True, "ipe": True, "pump": True, "rus_rx_ibm": False}
+    proven = PROVEN.get(args.bench, False)
+    if proven:
+        selected = "refresh (proven known state; gamma=1)" if C_max >= 1 else "none"
+    else:
+        selected = ("migrate (unknown state -> cost-model default since spec 13; "
+                    "fires where a cheap partner edge is cost-positive, else none; "
+                    "knit reachable only via force-knit)")
+    print(f"  pass strategy: {selected}")
     if knit_ok:
         print(f"  knit  cut (g4): C = C_min = {C}   ({C} iters = {C*B} layers)")
     else:

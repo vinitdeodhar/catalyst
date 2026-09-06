@@ -61,13 +61,13 @@ def PurlPauliAttr : EnumAttr<Purl_Dialect, PurlPauli, "pauli">;
 //===----------------------------------------------------------------------===//
 
 def YieldOp : Purl_Op<"yield", [Pure, ReturnLike, Terminator,
-        ParentOneOf<["QCutOp"]>]> {
-    let summary = "Terminate a purl.qcut `prep` region, yielding the prepared qubit.";
+        ParentOneOf<["RenewOp"]>]> {
+    let summary = "Terminate a purl.renew `prep` region, yielding the prepared qubit.";
     let arguments = (ins QubitType:$qubit);
     let assemblyFormat = [{ $qubit attr-dict `:` type($qubit) }];
 }
 
-def QCutOp : Purl_Op<"qcut", [SingleBlockImplicitTerminator<"YieldOp">]> {
+def RenewOp : Purl_Op<"renew", [SingleBlockImplicitTerminator<"YieldOp">]> {
     let summary = "Abstract single-wire cut of a carried loop qubit (spec 3.7).";
     let description = [{
         Emitted by `--purl` inside the periodic `if counter == C` cut guard, and

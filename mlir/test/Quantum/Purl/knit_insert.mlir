@@ -2,7 +2,7 @@
 //
 // KNIT insertion (spec 3.7). The carried wire takes a Clifford-but-not-Pauli
 // action (Hadamard) each iteration, so the known-state proof fails and --purl
-// falls back to the gamma=4 quasi cut. It emits an ABSTRACT purl.qcut with
+// falls back to the gamma=4 quasi cut. It emits an ABSTRACT purl.renew with
 // strategy=knit threading an f64 weight -- NOT the inline expansion, and with
 // NO @purl_sample_term (that is the lowering's job, --purl-lower-qcut). The carry
 // gains both an i32 counter and an f64 weight, and the quantum.expval output is
@@ -13,7 +13,7 @@
 // CHECK: scf.while ({{.*}}) : (i1, !quantum.bit, i32, f64) -> (i1, !quantum.bit, i32, f64)
 // CHECK: scf.if
 // the abstract knit cut op, threading the f64 weight in -> out
-// CHECK: purl.qcut
+// CHECK: purl.renew
 // CHECK-SAME: strategy = #purl<strategy knit>
 // CHECK: purl.yield
 // CHECK: (!quantum.bit, f64) -> (!quantum.bit, f64)

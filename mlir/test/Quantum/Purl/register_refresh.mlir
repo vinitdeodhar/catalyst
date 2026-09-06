@@ -5,7 +5,7 @@
 // H T H T H |0> and is NEVER extracted in the body (held identity); wire 1 is the
 // coin. --purl anchors on the observable (post-loop extract[0] -> namedobs),
 // classifies the held register slot as a CARRY, proves identity, and emits a
-// REFRESH purl.qcut by extracting the held wire from the register, cutting it, and
+// REFRESH purl.renew by extracting the held wire from the register, cutting it, and
 // re-inserting -- all while threading the !quantum.reg carry.
 
 // carry extended with an i32 counter, register still threaded
@@ -13,7 +13,7 @@
 // the register cut: extract held wire -> qcut{refresh} -> re-insert
 // CHECK: scf.if
 // CHECK: quantum.extract %{{[0-9]+}}[ 0]
-// CHECK: purl.qcut
+// CHECK: purl.renew
 // CHECK-SAME: strategy = #purl<strategy refresh>
 // CHECK: quantum.custom "Hadamard"
 // CHECK: quantum.custom "T"

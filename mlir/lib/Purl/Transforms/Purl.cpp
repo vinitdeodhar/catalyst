@@ -1514,17 +1514,17 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         return 0;
     }
 
-    // Emit an abstract purl.qcut at the current insertion point (two-phase, spec
+    // Emit an abstract purl.renew at the current insertion point (two-phase, spec
     // 3.7). All decisions are baked in: the strategy, the measurement `axis` and
     // KnownPauli `pauli_correction`, an optional f64 weight (knit), and the `prep`
     // region that re-prepares the known |psi0> (refresh) or is trivial (knit, whose
     // eigenstate prep the lowering builds from `axis`). --purl-lower-qcut expands it.
-    QCutOp emitQCut(OpBuilder &b, Location loc, Strategy strat, Value inQ, Value inW,
+    RenewOp emitRenew(OpBuilder &b, Location loc, Strategy strat, Value inQ, Value inW,
                     Pauli axis, Pauli corr, const PrepChain *prep)
     {
         MLIRContext *ctx = b.getContext();
         Type qT = inQ.getType();
-        OperationState st(loc, QCutOp::getOperationName());
+        OperationState st(loc, RenewOp::getOperationName());
         st.addOperands(inQ);
         SmallVector<Type> resTys{qT};
         if (inW) {
@@ -1547,7 +1547,7 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
             for (const std::string &g : prep->gates)
                 prepared = gate(rb, loc, g, prepared);
         YieldOp::create(rb, loc, prepared);
-        return cast<QCutOp>(b.create(st));
+        return cast<RenewOp>(b.create(st));
     }
 
     bool doRewrite(scf::WhileOp loop, int carryIdx, int C, Window win)
@@ -1635,7 +1635,7 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
             b, loc, docut,
             [&](OpBuilder &tb, Location l) {
                 // emit the abstract knit cut (spec 3.7); --purl-lower-qcut expands it
-                QCutOp qc = emitQCut(tb, l, Strategy::knit, carriedQ, wArg, Pauli::Z,
+                RenewOp qc = emitRenew(tb, l, Strategy::knit, carriedQ, wArg, Pauli::Z,
                                      Pauli::none, /*prep=*/nullptr);
                 scf::YieldOp::create(tb, l,
                                      ValueRange{qc.getOutQubit(), qc.getOutWeight()});
@@ -1962,7 +1962,7 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
                 if (slot >= 0)
                     toCut = ExtractOp::create(tb, l, QubitType::get(ctx), carriedVal,
                                               Value(), tb.getI64IntegerAttr(slot));
-                QCutOp qc = emitQCut(tb, l, Strategy::refresh, toCut,
+                RenewOp qc = emitRenew(tb, l, Strategy::refresh, toCut,
                                      /*inW=*/Value(), Pauli::Z, Pauli::none, &prep);
                 Value psi = qc.getOutQubit();
                 if (knownPauli)

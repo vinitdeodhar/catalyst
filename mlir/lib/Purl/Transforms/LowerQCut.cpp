@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// --purl-lower-qcut: mechanically expand each purl.qcut into its concrete op
+// --purl-lower-qcut: mechanically expand each purl.renew into its concrete op
 // sequence (spec 3.7). Purely code-generation -- no analysis, reads only the op.
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -71,7 +71,7 @@ static func::FuncOp getOrCreateSampleFn(Operation *anchor)
 
 // REFRESH (gamma=1): measure (end segment) + reset to |0> + replay the captured
 // |psi0> prep region. Weight-free; the expval upstream is untouched.
-static void lowerRefresh(QCutOp op)
+static void lowerRefresh(RenewOp op)
 {
     OpBuilder b(op);
     Location loc = op.getLoc();
@@ -99,7 +99,7 @@ static void lowerRefresh(QCutOp op)
 // KNIT (gamma=4): the quasi-probability cut protocol (spec 3.4a-f), threading the
 // f64 weight in_weight -> out_weight. The prep region is ignored (the eigenstate
 // prep is sampled here from the RNG hook).
-static void lowerKnit(QCutOp op)
+static void lowerKnit(RenewOp op)
 {
     OpBuilder b(op);
     Location loc = op.getLoc();
@@ -174,9 +174,9 @@ struct LowerQCutPass : impl::LowerQCutPassBase<LowerQCutPass> {
     void runOnOperation() final
     {
         // collect first: we erase each op as we expand it.
-        SmallVector<QCutOp> ops;
-        getOperation()->walk([&](QCutOp op) { ops.push_back(op); });
-        for (QCutOp op : ops) {
+        SmallVector<RenewOp> ops;
+        getOperation()->walk([&](RenewOp op) { ops.push_back(op); });
+        for (RenewOp op : ops) {
             if (op.getStrategy() == Strategy::refresh)
                 lowerRefresh(op);
             else

@@ -5,7 +5,7 @@
 // open a non-empty knit window. The carried state is still UNKNOWN (refresh remains
 // unsound), yet KNIT is valid -- its gamma=4 identity decomposition is unbiased for
 // ANY carried state -- so the pass emits the knit rewrite: an i32 cut counter and an
-// f64 quasi-probability WEIGHT threaded through the carry, a `purl.qcut` (strategy
+// f64 quasi-probability WEIGHT threaded through the carry, a `purl.renew` (strategy
 // knit) every C rounds, and the expval legalized to the weighted sample.
 
 // CHECK-LABEL: func.func @ipe_project
@@ -17,7 +17,7 @@
 // CHECK: quantum.measure
 // every C rounds: a quasi-probability knit cut threading the weight (NOT a refresh)
 // CHECK: scf.if
-// CHECK: purl.qcut
+// CHECK: purl.renew
 // CHECK-SAME: axis = #purl<pauli Z>
 // CHECK-SAME: strategy = #purl<strategy knit>
 // CHECK-NOT: strategy = #purl<strategy refresh>

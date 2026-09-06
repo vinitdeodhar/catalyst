@@ -28,10 +28,10 @@ using namespace mlir;
 using namespace catalyst::purl;
 
 //===----------------------------------------------------------------------===//
-// QCutOp
+// RenewOp
 //===----------------------------------------------------------------------===//
 
-LogicalResult QCutOp::verify()
+LogicalResult RenewOp::verify()
 {
     const bool isKnit = getStrategy() == Strategy::knit;
     const bool hasWeightIn = static_cast<bool>(getInWeight());

@@ -29,7 +29,7 @@ def Purl_Dialect : Dialect {
     let description = [{
         Purl cuts carry-type dynamic quantum loops to bound the carried wire's
         coherent depth. `--purl` (analysis + rewrite) emits one abstract cut op,
-        `purl.qcut`, at each periodic cut site with the chosen strategy baked in;
+        `purl.renew`, at each periodic cut site with the chosen strategy baked in;
         `--purl-lower-qcut` mechanically expands it. The dialect is deliberately
         separate from the core `quantum` dialect -- it only reuses `!quantum.bit`
         and the quantum observable attribute.
