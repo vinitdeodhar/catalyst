@@ -1233,6 +1233,38 @@ static RegCarry findRegisterCarry(scf::WhileOp loop)
     return rc;
 }
 
+// The scf.yield operand index of the loop's QuregType carry (the threaded register),
+// or -1 if none. Used by the register migrate rewrite, where the carried slot may be
+// touched by a non-Clifford body (so findRegisterCarry's untouched-slot check, which
+// targets the refresh identity proof, does not apply).
+static int registerYieldIdx(scf::WhileOp loop)
+{
+    auto yield = cast<scf::YieldOp>(loop.getAfter().front().getTerminator());
+    for (unsigned i = 0; i < yield.getNumOperands(); ++i)
+        if (isa<QuregType>(yield.getOperand(i).getType()))
+            return (int)i;
+    return -1;
+}
+
+// Trace a register value back through insert/extract to its defining AllocOp (the
+// register migrate grows this alloc by one wire for the ping-pong partner). Returns
+// null if the chain does not reach a static alloc.
+static AllocOp findRegAlloc(Value reg)
+{
+    llvm::DenseSet<Value> seen;
+    while (reg && seen.insert(reg).second) {
+        if (auto a = reg.getDefiningOp<AllocOp>())
+            return a;
+        if (auto ins = reg.getDefiningOp<InsertOp>())
+            reg = ins.getInQreg();
+        else if (auto ex = reg.getDefiningOp<ExtractOp>())
+            reg = ex.getQreg();
+        else
+            break;
+    }
+    return nullptr;
+}
+
 // Capture the |psi0> prep of a held register slot: trace the loop's init register
 // back through insert(idx=slot) to the prepared wire, then reuse captureInputPrep.
 static PrepChain captureInputPrepReg(scf::WhileOp loop, int64_t slot)
@@ -1375,7 +1407,10 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         if (shots > 0) {
             // Part 3.5 / 13.2: cost model chooses NONE / REFRESH / MIGRATE (or KNIT
             // via the comparison flag) and C. eps_mig = the 3-CNOT SWAP charge on the
-            // migrate pair edge at nominal noise (lam=1).
+            // migrate pair edge at nominal noise (lam=1). The register-threaded rewrite
+            // emits a second (swap-back) SWAP for positional-lowering reasons, but that
+            // is an implementation artifact applied IDEALLY by the device, so migrate is
+            // charged as a SINGLE swap here too (spec 13.2/13.3).
             EpsRates e = epsFromCalib(c, B, bs);
             double epsMig =
                 1.0 - std::pow(1.0 - c.pairG2, 3) * std::pow(1.0 - c.pairLeak, 3);
@@ -1479,16 +1514,34 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         Window wSel{wLo, wKnit.cMax};
         bool ok;
         if (info.carryArgIdx < 0) {
-            // register-threaded carry (real Catalyst IR). Only the gamma=1 refresh
-            // path supports it today (extract held wire -> qcut -> re-insert); the
+            // register-threaded carry (real Catalyst IR). refresh uses the untouched
+            // held-slot path (rc); migrate uses the classified carry slot, which may
+            // be touched by a non-Clifford body (rc.ok can be false there). The
             // gamma=4 knit-on-register path is not yet implemented.
-            if (!rc.ok || strat != CutStrategy::Refresh) {
-                loop.emitRemark("purl: register-threaded carry; refresh-only, "
-                                "analyses done");
+            if (strat == CutStrategy::Refresh) {
+                if (!rc.ok) {
+                    loop.emitRemark("purl: register-threaded carry; refresh needs an "
+                                    "untouched held slot, analyses done");
+                    return;
+                }
+                ok = doRewriteDeterministic(loop, rc.carryYieldIdx, C, wSel, fr, prep,
+                                            (int)rc.slot);
+            }
+            else if (strat == CutStrategy::Migrate) {
+                int ridx = registerYieldIdx(loop);
+                if (ridx < 0) {
+                    loop.emitRemark("purl: register-threaded carry; no register yield "
+                                    "operand, analyses done");
+                    return;
+                }
+                ok = doRewriteMigrateReg(loop, ridx, C, wSel, info.carrySlot,
+                                         c.pairK, c.pairKp);
+            }
+            else {
+                loop.emitRemark("purl: register-threaded carry; knit-on-register not "
+                                "implemented, analyses done");
                 return;
             }
-            ok = doRewriteDeterministic(loop, rc.carryYieldIdx, C, wSel, fr, prep,
-                                        (int)rc.slot);
         }
         else if (strat == CutStrategy::Refresh) {
             ok = doRewriteDeterministic(loop, info.carryArgIdx, C, wSel, fr, prep);
@@ -1561,6 +1614,11 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         OpBuilder b(loop);
         Location loc = loop.getLoc();
         Type i32 = b.getI32Type(), f64 = b.getF64Type(), i1 = b.getI1Type();
+
+        // carry the fidelity prediction onto the replacement loop (§14.7); see
+        // doRewriteDeterministic.
+        Attribute predF = loop->getAttr("purl.predicted_fidelity");
+        Attribute fatD = loop->getAttr("purl.fidelity_at_depth");
 
         // applicability precheck: expval of a namedobs on the carried result
         ObsChain oc = findObsChain(loop, carryIdx);
@@ -1701,6 +1759,10 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         nl->setAttr("purl.cut", b.getStringAttr("quasiprobability"));
         nl->setAttr("purl.strategy", b.getStringAttr("knit"));
         nl->setAttr("purl.known_state", b.getStringAttr("none"));
+        if (predF)
+            nl->setAttr("purl.predicted_fidelity", predF);
+        if (fatD)
+            nl->setAttr("purl.fidelity_at_depth", fatD);
         return true;
     }
 
@@ -1709,7 +1771,9 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
     // carrier onto the fresh partner (three CNOTs), then reset the swapped-out (now
     // idle) qubit -- the state moves WITHOUT being measured/re-prepared/known, and
     // carrier-stuck leakage stays behind on the reset wire. Unweighted; the expval
-    // is intact (like refresh). Bare-qubit carry only.
+    // is intact (like refresh).
+    //
+    // Bare-qubit carry only (the register-threaded carry uses doRewriteMigrateReg).
     bool doRewriteMigrate(scf::WhileOp loop, int carryIdx, int C, Window win,
                           int pairK, int pairKp)
     {
@@ -1719,6 +1783,11 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         Type i32 = b.getI32Type();
         Type qty = QubitType::get(ctx);
         Type rty = QuregType::get(ctx);
+
+        // carry the fidelity prediction onto the replacement loop (§14.7); see
+        // doRewriteDeterministic.
+        Attribute predF = loop->getAttr("purl.predicted_fidelity");
+        Attribute fatD = loop->getAttr("purl.fidelity_at_depth");
 
         ObsChain oc = findObsChain(loop, carryIdx);
         if (!oc.ok)
@@ -1786,11 +1855,18 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         Value zero = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(0));
         Value atC =
             arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, rem, zero);
+        // Gate the cut on the counter (every C iterations). If the loop carries a
+        // boolean fail flag (RUS-style herald), AND it in so we only migrate while
+        // still failing; loops with a compound condition (e.g. pos!=0 & k<max, no
+        // carried i1 flag -- qwalk/ipe_project) migrate purely on the counter. SWAP
+        // preserves the state, so cutting on a terminal iteration stays correct.
         Value failVal = amap.lookupOrDefault(oldYield.getOperand(failIdx));
         Value failI1 = failVal;
         if (!failI1.getType().isInteger(1) && isa<TensorType>(failI1.getType()))
             failI1 = tensor::ExtractOp::create(b, loc, failVal, ValueRange{});
-        Value doMig = arith::AndIOp::create(b, loc, failI1, atC);
+        Value doMig = failI1.getType().isInteger(1)
+                          ? arith::AndIOp::create(b, loc, failI1, atC).getResult()
+                          : atC;
 
         // SWAP(live, partner) via three CNOTs; after, the STATE is on the partner
         // wire and the old carrier holds |0>. Reset the old carrier (measure + X,
@@ -1808,9 +1884,9 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
                     auto outs = op.getOutQubits();
                     return {outs[0], outs[1]};
                 };
-                auto [x1, y1] = cnot(liveVal, partnerArg); // CNOT(live, partner)
-                auto [y2, x2] = cnot(y1, x1);              // CNOT(partner, live)
-                auto [x3, y3] = cnot(x2, y2);              // CNOT(live, partner)
+                auto [x1, y1] = cnot(liveVal, partnerArg);  // CNOT(live, partner)
+                auto [y2, x2] = cnot(y1, x1);               // CNOT(partner, live)
+                auto [x3, y3] = cnot(x2, y2);               // CNOT(live, partner)
                 // x3 holds |0> (old partner), y3 holds the state (old live)
                 Value newLive = y3;
                 // reset the swapped-out wire x3 -> fresh |0> partner
@@ -1856,6 +1932,192 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         nl->setAttr("purl.strategy", b.getStringAttr("migrate"));
         nl->setAttr("purl.known_state", b.getStringAttr("none"));
         nl->setAttr("purl.pair", b.getDenseI64ArrayAttr({pairK, pairKp}));
+        if (predF)
+            nl->setAttr("purl.predicted_fidelity", predF);
+        if (fatD)
+            nl->setAttr("purl.fidelity_at_depth", fatD);
+        return true;
+    }
+
+    // Register-threaded MIGRATE (spec 13). The carried state lives at `carrySlot` of
+    // the loop's !quantum.reg (a possibly-touched, unknown state). We GROW that
+    // register by one wire -- the partner, slot N -- and every C iterations do a
+    // DOUBLE SWAP: move the state onto the partner, reset the vacated carrier (clearing
+    // its accumulated leakage), then SWAP the state back onto the now-clean carrier.
+    // Each physical wire returns to its OWN slot, so no cross-slot insert is needed
+    // (the positional lowering does not relocate a foreign wire between slots -- only
+    // same-slot round-trips survive), and the observable keeps reading `carrySlot`,
+    // intact, on a leakage-cleared qubit. Unknown-state safe: no proof, no re-prep,
+    // gamma=1. The swap-BACK is a positional-lowering artifact, emitted as a single
+    // ideal "SWAP" (applied noiselessly by the device), so the cut charges as ONE real
+    // 3-CNOT SWAP + one reset -- matching the bare-qubit migrate cost (spec 13.2/13.3).
+    bool doRewriteMigrateReg(scf::WhileOp loop, int carryIdx, int C, Window win,
+                             int carrySlot, int pairK, int pairKp)
+    {
+        OpBuilder b(loop);
+        Location loc = loop.getLoc();
+        MLIRContext *ctx = b.getContext();
+        Type i32 = b.getI32Type();
+        Type qty = QubitType::get(ctx);
+
+        Attribute predF = loop->getAttr("purl.predicted_fidelity");
+        Attribute fatD = loop->getAttr("purl.fidelity_at_depth");
+
+        // grow the register alloc by one wire -> partner slot N (static-size only).
+        AllocOp alloc = findRegAlloc(loop.getInits()[carryIdx]);
+        if (!alloc || !alloc.getNqubitsAttr().has_value())
+            return false;
+        int64_t oldN = *alloc.getNqubitsAttr();
+        int partnerSlot = (int)oldN;
+        alloc.setNqubitsAttrAttr(b.getI64IntegerAttr(oldN + 1));
+
+        int failIdx = failIndex(loop);
+        unsigned nCarry = loop.getNumResults();
+
+        // --- carry extension: +i32 counter only (the partner lives in the register) ---
+        b.setInsertionPoint(loop);
+        Value c0i32 = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(0));
+        SmallVector<Value> inits(loop.getInits().begin(), loop.getInits().end());
+        inits.push_back(c0i32);
+        SmallVector<Type> resTys(loop.getResultTypes().begin(),
+                                 loop.getResultTypes().end());
+        resTys.push_back(i32);
+        auto nl = scf::WhileOp::create(b, loc, resTys, inits);
+
+        // BEFORE region
+        Block &oldBefore = loop.getBefore().front();
+        Block *nb = b.createBlock(&nl.getBefore());
+        for (Value in : inits)
+            nb->addArgument(in.getType(), loc);
+        IRMapping bmap;
+        for (unsigned i = 0; i < oldBefore.getNumArguments(); ++i)
+            bmap.map(oldBefore.getArgument(i), nb->getArgument(i));
+        b.setInsertionPointToEnd(nb);
+        for (Operation &op : oldBefore.without_terminator())
+            b.clone(op, bmap);
+        auto oldCond = cast<scf::ConditionOp>(oldBefore.getTerminator());
+        SmallVector<Value> fwd;
+        for (Value v : oldCond.getArgs())
+            fwd.push_back(bmap.lookupOrDefault(v));
+        unsigned n = oldBefore.getNumArguments();
+        fwd.push_back(nb->getArgument(n));
+        scf::ConditionOp::create(
+            b, loc, bmap.lookupOrDefault(oldCond.getCondition()), fwd);
+
+        // AFTER region
+        Block &oldAfter = loop.getAfter().front();
+        Block *na = b.createBlock(&nl.getAfter());
+        for (BlockArgument a : oldAfter.getArguments())
+            na->addArgument(a.getType(), loc);
+        Value itArg = na->addArgument(i32, loc);
+        IRMapping amap;
+        for (unsigned i = 0; i < oldAfter.getNumArguments(); ++i)
+            amap.map(oldAfter.getArgument(i), na->getArgument(i));
+        b.setInsertionPointToEnd(na);
+        for (Operation &op : oldAfter.without_terminator())
+            b.clone(op, amap);
+        auto oldYield = cast<scf::YieldOp>(oldAfter.getTerminator());
+
+        Value c1i32 = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(1));
+        Value it1 = arith::AddIOp::create(b, loc, itArg, c1i32);
+        Value cC = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(C));
+        Value rem = arith::RemSIOp::create(b, loc, it1, cC);
+        Value zero = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(0));
+        Value atC =
+            arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, rem, zero);
+        // gate on the fail flag if the loop carries an i1 one; else purely on the
+        // counter (compound loop condition -- qwalk/ipe_project, see doRewriteMigrate).
+        Value failVal = amap.lookupOrDefault(oldYield.getOperand(failIdx));
+        Value failI1 = failVal;
+        if (!failI1.getType().isInteger(1) && isa<TensorType>(failI1.getType()))
+            failI1 = tensor::ExtractOp::create(b, loc, failVal, ValueRange{});
+        Value doMig = failI1.getType().isInteger(1)
+                          ? arith::AndIOp::create(b, loc, failI1, atC).getResult()
+                          : atC;
+
+        Value regVal = amap.lookupOrDefault(oldYield.getOperand(carryIdx));
+        auto migIf = scf::IfOp::create(
+            b, loc, doMig,
+            [&](OpBuilder &tb, Location l) {
+                Value held = ExtractOp::create(tb, l, qty, regVal, Value(),
+                                               tb.getI64IntegerAttr(carrySlot));
+                Value part = ExtractOp::create(tb, l, qty, regVal, Value(),
+                                               tb.getI64IntegerAttr(partnerSlot));
+                auto cnot = [&](Value cq, Value tq) -> std::pair<Value, Value> {
+                    auto op = CustomOp::create(tb, l, "CNOT", ValueRange{cq, tq},
+                                               ValueRange{}, ValueRange{},
+                                               ValueRange{});
+                    auto outs = op.getOutQubits();
+                    return {outs[0], outs[1]};
+                };
+                auto swap = [&](Value a, Value b) -> std::pair<Value, Value> {
+                    auto [a1, b1] = cnot(a, b);
+                    auto [b2, a2] = cnot(b1, a1);
+                    auto [a3, b3] = cnot(a2, b2);
+                    return {a3, b3}; // states of a and b exchanged
+                };
+                // Double SWAP: move the state OFF the carrier onto the partner, RESET
+                // the vacated carrier (clearing its accumulated leakage while it holds
+                // |0>), then SWAP the state BACK. Each physical wire returns to its OWN
+                // slot -- no cross-slot insert (positional lowering does not relocate a
+                // foreign wire) -- so the observable reads carrySlot intact, on a qubit
+                // whose leakage was just cleared. gamma=1, unknown-state safe.
+                auto [carrier0, partWithState] = swap(held, part);
+                // carrier0 = |0> (old carrier), partWithState = the migrated state
+                auto m = MeasureOp::create(tb, l, tb.getI1Type(), qty, carrier0,
+                                           IntegerAttr());
+                Value carrierReset =
+                    guarded(tb, l, m.getMres(), m.getOutQubit(),
+                            [&](OpBuilder &gb, Value in) {
+                                return gate(gb, l, "PauliX", in);
+                            });
+                // swap BACK via a single SWAP op. This second swap exists ONLY to
+                // return each physical wire to its own register slot (the positional
+                // lowering cannot re-insert a foreign wire at another slot), so it is an
+                // implementation artifact -- the qsim device applies "SWAP" IDEALLY
+                // (noiselessly) and the cost model charges just ONE swap (§13.2/13.3).
+                auto swapBack = CustomOp::create(
+                    tb, l, "SWAP", ValueRange{carrierReset, partWithState},
+                    ValueRange{}, ValueRange{}, ValueRange{});
+                Value carrierState = swapBack.getOutQubits()[0];
+                Value partClean = swapBack.getOutQubits()[1];
+                // carrierState = state back on the leakage-cleared carrier; partClean = |0>
+                Value r1 = InsertOp::create(tb, l, regVal.getType(), regVal, Value(),
+                                            tb.getI64IntegerAttr(carrySlot),
+                                            carrierState);
+                Value r2 = InsertOp::create(tb, l, regVal.getType(), r1, Value(),
+                                            tb.getI64IntegerAttr(partnerSlot), partClean);
+                scf::YieldOp::create(tb, l, ValueRange{r2});
+            },
+            [&](OpBuilder &eb, Location l) {
+                scf::YieldOp::create(eb, l, ValueRange{regVal});
+            });
+        Value newReg = migIf.getResult(0);
+
+        SmallVector<Value> ny;
+        for (unsigned i = 0; i < oldYield.getNumOperands(); ++i) {
+            Value v = amap.lookupOrDefault(oldYield.getOperand(i));
+            ny.push_back(i == (unsigned)carryIdx ? newReg : v);
+        }
+        ny.push_back(it1);
+        scf::YieldOp::create(b, loc, ny);
+
+        for (unsigned i = 0; i < nCarry; ++i)
+            loop.getResult(i).replaceAllUsesWith(nl.getResult(i));
+        loop.erase();
+
+        nl->setAttr("purl.applied", b.getBoolAttr(true));
+        nl->setAttr("purl.C", b.getI64IntegerAttr(C));
+        nl->setAttr("purl.cut_period", b.getI64IntegerAttr(C));
+        nl->setAttr("purl.window", b.getDenseI64ArrayAttr({win.cMin, win.cMax}));
+        nl->setAttr("purl.cut", b.getStringAttr("swap"));
+        nl->setAttr("purl.strategy", b.getStringAttr("migrate"));
+        nl->setAttr("purl.known_state", b.getStringAttr("none"));
+        nl->setAttr("purl.pair", b.getDenseI64ArrayAttr({pairK, pairKp}));
+        if (predF)
+            nl->setAttr("purl.predicted_fidelity", predF);
+        if (fatD)
+            nl->setAttr("purl.fidelity_at_depth", fatD);
         return true;
     }
 
@@ -1872,6 +2134,12 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         Location loc = loop.getLoc();
         MLIRContext *ctx = b.getContext();
         Type i32 = b.getI32Type();
+
+        // The fidelity prediction was set on the original loop in processLoop; the
+        // rewrite replaces that op, so capture and re-attach it to the new loop (the
+        // eval reports pass-predicted-vs-measured for the SELECTED strategy, §14.7).
+        Attribute predF = loop->getAttr("purl.predicted_fidelity");
+        Attribute fatD = loop->getAttr("purl.fidelity_at_depth");
 
         // slot < 0: bare-qubit carry (needs an expval on the carried result to
         // legalize). slot >= 0: register-threaded carry (findRegisterCarry already
@@ -2033,6 +2301,10 @@ struct PurlPass : impl::PurlPassBase<PurlPass> {
         nl->setAttr("purl.strategy", b.getStringAttr("refresh"));
         nl->setAttr("purl.known_state",
                     b.getStringAttr(knownPauli ? "pauli" : "identity"));
+        if (predF)
+            nl->setAttr("purl.predicted_fidelity", predF);
+        if (fatD)
+            nl->setAttr("purl.fidelity_at_depth", fatD);
         return true;
     }
 };

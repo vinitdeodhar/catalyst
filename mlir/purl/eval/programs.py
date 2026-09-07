@@ -34,56 +34,68 @@ def _dev(wires, lam, shots, carry_qubit=0, calib=CALIB):
                       shots=shots)
 
 
-# --- rus (= rus_lowp): held magic state |psi0>=H T H T H|0>, low-p CNOT herald.
-# Provable identity on the held wire -> the pass selects REFRESH. Ideal <Z> = 0.5.
-def rus(lam, seed, shots=1500, p=0.1, calib=CALIB, keep=False):
-    dev = _dev(2, lam, shots, 0, calib)
+# Two arms through the identical compiled path (§14.7): purl_on=True applies both
+# passes (the pass selects and lowers the cut); purl_on=False omits them (the
+# unbounded baseline -- same program, no cut). Only the passes differ.
+def _build(qnode_fn, ideal, seed, keep, purl_on, calib, p):
+    fn = qnode_fn
+    if purl_on:
+        fn = purl(calib=calib, p=p, shots=6000)(fn)
+        fn = purl_lower_qcut(fn)
+    return qjit(fn, seed=seed, keep_intermediate=keep), ideal
 
-    @qjit(seed=seed, keep_intermediate=keep)
-    @purl_lower_qcut
-    @purl(calib=calib, p=p, shots=6000)
+
+# --- rus: held magic state |psi0>=H T H T H|0>, low-p herald. The held wire idles
+# (untouched) through each attempt, so it is an untouched register slot -> provable
+# identity -> REFRESH, which re-prepares the ideal state and clears the idle T1/T2
+# decoherence accumulated over the hold (escapes the §11 no-go; no leakage needed).
+# Ideal <Z> = 0.5.
+def rus(lam, seed, shots=1500, p=0.1, calib=CALIB, keep=False, purl_on=True):
+    dev = _dev(2, lam, shots, 0, calib)
+    # biased herald coin so the loop STOPS with prob p (mean trips = 1/p): RY(theta)|0>
+    # has P(measure 0) = cos^2(theta/2) = p, so theta = 2*acos(sqrt(p)). Matching the
+    # runtime p to the p the pass is told makes mean depth (1/p) exceed the cap C.
+    theta = 2.0 * math.acos(math.sqrt(p))
+
     @qml.qnode(dev, mcm_method="one-shot")
     def f():
         qml.Hadamard(0); qml.T(0); qml.Hadamard(0); qml.T(0); qml.Hadamard(0)
 
-        @while_loop(lambda c: c)
-        def loop(c):
-            qml.CNOT(wires=[0, 1])            # net-identity touch on the held wire
-            qml.CNOT(wires=[0, 1])
-            qml.Hadamard(1)
-            m = measure(1)                    # low-p herald (target-independent)
-            return m
+        @while_loop(lambda c, k: c)
+        def loop(c, k):
+            qml.RY(theta, wires=1)            # low-p herald on a FRESH |0> coin
+            m = measure(1, reset=True)        # reset -> next RY sees |0> (stable p)
+            return m, k + 1                   # k = trip counter (runtime depth)
 
-        loop(True)
-        return qml.expval(qml.PauliZ(0))
+        _, k = loop(True, 0)
+        return qml.expval(qml.PauliZ(0)), k
 
-    return f, 0.5   # (program, ideal <Z>)
+    return _build(f, 0.5, seed, keep, purl_on, calib, p)   # (program, ideal <Z>)
 
 
-# --- ipe: held eigenstate |+>, adaptive herald loop. Provable identity -> REFRESH.
-# Ideal <X> = 1 (read via the returned PauliX expval).
-def ipe(lam, seed, shots=1500, p=0.12, calib=CALIB, keep=False):
+# --- ipe: held eigenstate |+>, adaptive herald loop. The held wire idles (untouched)
+# through each round -> untouched register slot -> provable identity -> REFRESH clears
+# the idle decoherence accumulated over the hold. Ideal <X> = 1 (returned PauliX).
+def ipe(lam, seed, shots=1500, p=0.12, calib=CALIB, keep=False, purl_on=True):
     dev = _dev(2, lam, shots, 0, calib)
+    # biased herald coin: STOP prob p (mean trips = 1/p), theta = 2*acos(sqrt(p)) so
+    # mean depth exceeds the cap C and refresh fires on most shots (see rus).
+    theta = 2.0 * math.acos(math.sqrt(p))
 
-    @qjit(seed=seed, keep_intermediate=keep)
-    @purl_lower_qcut
-    @purl(calib=calib, p=p, shots=6000)
     @qml.qnode(dev, mcm_method="one-shot")
     def f():
         qml.Hadamard(0)                       # held eigenstate |+>
 
-        @while_loop(lambda c: c)
-        def loop(c):
-            qml.CNOT(wires=[0, 1])            # net-identity phase-kickback touch
-            qml.CNOT(wires=[0, 1])
-            qml.Hadamard(1)
-            m = measure(1)
-            return m
+        @while_loop(lambda c, k: c)
+        def loop(c, k):
+            qml.RY(theta, wires=1)            # low-p herald on a FRESH |0> coin
+            m = measure(1, reset=True)        # reset -> next RY sees |0> (stable p)
+            return m, k + 1                   # k = trip counter (runtime depth)
 
-        loop(True)
-        return qml.expval(qml.PauliX(0))
+        _, k = loop(True, 0)
+        return qml.expval(qml.PauliX(0)), k
 
-    return f, 1.0   # (program, ideal <X>)
+    return _build(f, 1.0, seed, keep, purl_on, calib, p)   # (program, ideal <X>)
 
 
 # --- qwalk: fat-tailed random-walk herald, 2q-heavy net-identity non-Clifford body.
@@ -93,12 +105,10 @@ def ipe(lam, seed, shots=1500, p=0.12, calib=CALIB, keep=False):
 _QW_RY, _QW_RZ = 0.4, 0.7
 
 
-def qwalk(lam, seed, shots=1500, p=0.5, calib=CALIB, max_trips=60, keep=False):
+def qwalk(lam, seed, shots=1500, p=0.5, calib=CALIB, max_trips=60, keep=False,
+          purl_on=True):
     dev = _dev(3, lam, shots, 0, calib)  # 0=data, 1=sandwich ancilla, 2=walk coin
 
-    @qjit(seed=seed, keep_intermediate=keep)
-    @purl_lower_qcut
-    @purl(calib=calib, p=p, shots=6000)
     @qml.qnode(dev, mcm_method="one-shot")
     def f():
         qml.RY(_QW_RY, wires=0); qml.RZ(_QW_RZ, wires=0)     # held reference
@@ -113,12 +123,13 @@ def qwalk(lam, seed, shots=1500, p=0.5, calib=CALIB, max_trips=60, keep=False):
             # random-walk step from a fresh |+> coin: +1 if 1 else -1
             qml.Hadamard(2)
             b = measure(2, reset=True)
-            return pos + (2 * b - 1), k + 1
+            return pos + (2 * b - 1), k + 1     # k = trip counter (runtime depth)
 
-        loop(1, 0)
-        return qml.expval(qml.PauliZ(0))
+        _, k = loop(1, 0)
+        return qml.expval(qml.PauliZ(0)), k
 
-    return f, math.cos(_QW_RY)   # ideal <Z> = cos(0.4) = 0.9211
+    # ideal <Z> = cos(0.4) = 0.9211
+    return _build(f, math.cos(_QW_RY), seed, keep, purl_on, calib, p)
 
 
 # --- ipe_project: phase-estimation-as-projection. Held SUPERPOSITION of the
@@ -135,13 +146,10 @@ _L01 = math.cos(_THETA / 4 + math.pi / 4) ** 2    # P(b=0 | eigenstate 1)
 
 
 def ipe_project(lam, seed, shots=1500, p=0.45, calib=CALIB, thresh=0.87,
-                max_trips=10, keep=False):
+                max_trips=10, keep=False, purl_on=True):
     dev = _dev(2, lam, shots, 0, calib)          # 0=data, 1=ancilla
     prior0 = math.cos(_ALPHA) ** 2
 
-    @qjit(seed=seed, keep_intermediate=keep)
-    @purl_lower_qcut
-    @purl(calib=calib, p=p, shots=6000)
     @qml.qnode(dev, mcm_method="one-shot")
     def f():
         qml.RY(2.0 * _ALPHA, wires=0)            # cos(a)|0> + sin(a)|1> (unknown)
@@ -161,7 +169,7 @@ def ipe_project(lam, seed, shots=1500, p=0.45, calib=CALIB, thresh=0.87,
             p0n = num / (num + (1.0 - p0) * L1)
             return p0n, k + 1
 
-        p0f, _ = loop(prior0, 0)
+        p0f, k = loop(prior0, 0)             # k = trip counter (runtime depth)
 
         # align the delivered wire to the shot's posterior winner: if winner==1
         # (p0<0.5) flip the Z-frame, so <Z> scores fidelity to |winner> (ideal +1)
@@ -170,9 +178,10 @@ def ipe_project(lam, seed, shots=1500, p=0.45, calib=CALIB, thresh=0.87,
             qml.PauliX(0)         # side effect only (both branches return None)
 
         _align()
-        return qml.expval(qml.PauliZ(0))
+        return qml.expval(qml.PauliZ(0)), k
 
-    return f, 1.0   # ideal <Z> = +1 (winner-aligned per-shot reference)
+    # ideal <Z> = +1 (winner-aligned per-shot reference)
+    return _build(f, 1.0, seed, keep, purl_on, calib, p)
 
 
 # All four benchmarks are Python @qjit programs compiled through the ENTIRE Catalyst

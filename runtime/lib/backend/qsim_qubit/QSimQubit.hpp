@@ -52,6 +52,7 @@ class QSimQubit final : public Catalyst::Runtime::QuantumDevice {
 
     // --- trajectory state ---
     std::size_t n_ = 0, shots_ = 0;
+    std::size_t live_ = 0;            // qubits allocated but not yet released
     std::vector<cd> psi_;             // statevector, little-endian (qubit 0 = LSB)
     std::vector<char> leaked_;        // absorbing per-qubit leakage flags
     std::mt19937 own_rng_{0};
@@ -96,23 +97,44 @@ class QSimQubit final : public Catalyst::Runtime::QuantumDevice {
     QSimQubit &operator=(QSimQubit &&) = delete;
 
     // ---------------- qubit / execution management ----------------
+    // Additive allocation: a program may allocate more than one register (e.g. the
+    // migrate rewrite adds a fresh partner qubit as a separate quantum.alloc). Append
+    // the new qubits as high-order wires in |0> -- little-endian, so existing
+    // amplitudes keep their indices -- and hand back ids offset past the live count.
     auto AllocateQubits(std::size_t n) -> std::vector<QubitIdType> override
     {
-        n_ = n;
+        std::size_t base = n_;
+        n_ += n;
+        std::vector<cd> old;
+        old.swap(psi_);
         psi_.assign(std::size_t(1) << n_, cd(0.0, 0.0));
-        if (!psi_.empty())
-            psi_[0] = cd(1.0, 0.0);
-        leaked_.assign(n_, 0);
-        std::vector<QubitIdType> ids(n_);
-        for (std::size_t i = 0; i < n_; ++i)
-            ids[i] = (QubitIdType)i;
+        if (base == 0) {
+            if (!psi_.empty())
+                psi_[0] = cd(1.0, 0.0);
+        }
+        else {
+            for (std::size_t i = 0; i < old.size(); ++i) // new bits = 0 -> same index
+                psi_[i] = old[i];
+        }
+        leaked_.resize(n_, 0);
+        live_ += n;
+        std::vector<QubitIdType> ids(n);
+        for (std::size_t i = 0; i < n; ++i)
+            ids[i] = (QubitIdType)(base + i);
         return ids;
     }
-    void ReleaseQubits(const std::vector<QubitIdType> &) override
+    // Non-destructive until the last register is freed. A mid-circuit release (the
+    // migrate partner, reset to |0> and disentangled) must NOT wipe the state before
+    // the terminal observable; only a full release resets the trajectory so the next
+    // one-shot run starts fresh.
+    void ReleaseQubits(const std::vector<QubitIdType> &ids) override
     {
-        psi_.clear();
-        leaked_.clear();
-        n_ = 0;
+        live_ -= std::min(live_, ids.size());
+        if (live_ == 0) {
+            psi_.clear();
+            leaked_.clear();
+            n_ = 0;
+        }
     }
     auto GetNumQubits() const -> std::size_t override { return n_; }
     void SetDeviceShots(std::size_t s) override { shots_ = s; }
@@ -340,6 +362,21 @@ class QSimQubit final : public Catalyst::Runtime::QuantumDevice {
         std::vector<std::size_t> ctrl;
         for (auto q : controlled_wires)
             ctrl.push_back((std::size_t)q);
+
+        // SWAP is emitted ONLY as the register-migrate swap-BACK, which exists purely
+        // to work around Catalyst's positional register lowering (a foreign wire cannot
+        // be re-inserted at another slot; the state must round-trip to its own slot).
+        // That round-trip is an implementation artifact, not physical cost, so the
+        // migrate cut is charged as a SINGLE swap: the first (real) swap runs as three
+        // noisy CNOTs, and this swap-back is applied IDEALLY (no idle/depol/leakage),
+        // matching the cost model's 3-CNOT charge (spec 13.2/13.3).
+        if (name == "SWAP") {
+            cd X[2][2] = {{cd(0, 0), cd(1, 0)}, {cd(1, 0), cd(0, 0)}};
+            applyCtrl1q(X, {w[0]}, w[1]);
+            applyCtrl1q(X, {w[1]}, w[0]);
+            applyCtrl1q(X, {w[0]}, w[1]);
+            return;
+        }
 
         // multi-qubit named gates -> canonicalize to (controls..., target)
         std::string nm = name;

@@ -897,6 +897,10 @@ table.
    empirical best-C that S4 checks the pass window brackets.
 
 ### 8.2 Output table (with legend)
+*(Compiled-execution path: superseded by the two-arm table of §14.7 — the compiled arm
+runs only the pass-selected strategy, so the three-arm columns below apply only to the
+retained §5-simulator cross-check.)*
+
 Columns: `benchmark[config]`, `lam`, runtime coherent depth of the unbounded arm
 (`depth/iter`, `min/mean/max_iters`, `runtime_depth`), delivered fidelity
 (`unbounded`, `knit(g4)`, `refresh(g1)` — mean ± seed-std), the pass-selected
@@ -1206,7 +1210,7 @@ multi-qubit carry; post-selection or shot discarding in any form.
 
 ---
 
-## 13. Migrate strategy — swap-based carrier replacement (roadmap — not yet implemented)
+## 13. Migrate strategy — swap-based carrier replacement (implemented; register-threaded uses a double SWAP)
 
 **Migrate is a new cut strategy for `unknown` carried states, and it changes the
 decision procedure.** Every `C` iterations the carried state is **SWAPped** onto a
@@ -1273,6 +1277,11 @@ the expected leakage cleared per window exceeds `eps_mig`; first-order admissibi
 C · n2q · p_leak  >  3·(g_e + l_e)     (evaluated at the candidate C)
 ```
 
+Charged as **one** 3-CNOT SWAP for both carry representations. The register-threaded
+rewrite emits a second (swap-back) SWAP, but that is a positional-lowering artifact
+applied **ideally** (noiselessly) by the device and not charged by the cost model
+(§13.3), so bare and register migrate have the same per-cut cost.
+
 Predicted fidelity: the non-transportable term becomes **per-window** rather than
 per-lifetime, `F1_nt = (1 − p_leak)^(n2q·s_win)` with `s_win` the mean age within a
 window (reuse the existing `sbar(C)` machinery), multiplied by
@@ -1283,15 +1292,42 @@ else migrate at the arg-min `C ∈ [1, C_max]` if any `C` is cost-positive; else
 
 ### 13.3 IR changes
 
-The migrate rewrite mirrors the **refresh** rewrite's counter and guard. The `scf.if`
-body emits the three `quantum.custom "CNOT"` ops between the carried SSA value and the
-partner qubit value, threading **both** through the loop's `iter_args` (the partner
-enters the loop as a second carried value, initialized from a freshly allocated +
-reset qubit). Emitted attributes: `purl.strategy = "migrate"`, `purl.cut_period`,
-`purl.pair = [k, k']`, plus the existing decision-audit attributes. The abandoned
-qubit's reset is a `quantum.reset` on the swapped-out value **inside the same
-`scf.if`**, after the CNOTs (the simulator treats it as off-path, §5). Expval
-legalization is untouched — migrate produces an **unweighted** estimate.
+The migrate rewrite mirrors the **refresh** rewrite's counter and guard; the `scf.if`
+body performs the SWAP-based carrier replacement. Two carry representations:
+
+**Bare-qubit carry** (`doRewriteMigrate`, `info.carryArgIdx ≥ 0`). The partner enters
+the loop as a **second carried qubit value** (`iter_args`), initialized from a freshly
+allocated + reset qubit. Each cut emits **three** `quantum.custom "CNOT"` ops between
+the carried value and the partner (one SWAP), then a measure+conditional-X reset of the
+swapped-out value; the carry follows the state onto the partner (ping-pong). `s = 3`.
+
+**Register-threaded carry** (`doRewriteMigrateReg`, `info.carryArgIdx < 0` — what real
+Catalyst emits). The carried state lives at `carrySlot` of the loop's `!quantum.reg`.
+The rewrite **grows that register's `quantum.alloc` by one wire** (the partner, slot
+`N`) and, at each cut, performs a **DOUBLE SWAP**: (1) SWAP the state off the carrier
+onto the partner (three real, noisy CNOTs — the one physical migration cost); (2)
+measure+conditional-X **reset the vacated carrier** (clearing its accumulated leakage
+while it holds `|0⟩`); (3) SWAP the state **back** onto the now-clean carrier. Each
+physical wire is re-inserted at its **own** slot — there is **no cross-slot insert**,
+because the positional lowering does not relocate a foreign wire between register slots
+(only same-slot round-trips survive; a single SWAP that re-inserted the partner wire at
+`carrySlot` silently delivers `|0⟩`).
+
+The swap-back (step 3) exists **only** for this positional-lowering reason — it is an
+**implementation artifact, not physical cost** — so it is emitted as a single
+`quantum.custom "SWAP"` that the qsim device applies **ideally** (no depol/leakage/idle,
+§14.2) and the cost model does not charge. Net *charged* cost per cut is therefore **one
+3-CNOT SWAP + one reset** (`s = 3`), identical to the bare-qubit carry. The partner
+needs no extra `iter_arg` (the register threads it). The observable reads `carrySlot`,
+intact. Verified: at `lam = 0` the applied cut is an exact logical no-op.
+
+Emitted attributes (both paths): `purl.strategy = "migrate"`, `purl.cut = "swap"`,
+`purl.cut_period`, `purl.pair = [k, k']`, plus the existing decision-audit attributes
+(including the forwarded `purl.predicted_fidelity`). Expval legalization is untouched —
+migrate produces an **unweighted** estimate.
+
+The **knit-on-register** path remains unimplemented (register carries route refresh or
+migrate only).
 
 ### 13.4 Calibration JSON schema (leakage — restated, normative)
 
@@ -1489,22 +1525,64 @@ picks the strategy, the device applies the noise, the driver scores uniformly.
   un-measured through-wire is the data carry. This is what lets `qwalk`/`ipe_project`
   (persistent sandwich/coin/posterior ancillas) present a single data carry. The `§7
   two_carry` guard still fires only for **two genuine un-measured data carries**.
-- **What the pass does per benchmark:** `rus`/`ipe` (provable identity) → **refresh**,
-  which has a register-threaded rewrite → the cut fires. `qwalk`/`ipe_project`
-  (unknown) → the cost model evaluates and, on the uniform-leak IBM calib, selects
-  **none** (migrate is not cost-positive there), so they run uncut. This is a genuine
-  cost-model decision, made in-pipeline.
-- **Known capability gap (not a requirement violation):** the **migrate/knit rewrites
-  exist only for bare-qubit carries**, not the register-threaded carries real Catalyst
-  emits. So even where the cost model *would* select migrate/knit on an unknown
-  register carry, the rewrite would decline (refresh-only register path). Making
-  migrate/knit fire on `qwalk`/`ipe_project` through the pipeline needs the
-  register-threaded migrate/knit rewrite (future work); until then they exercise the
-  full pipeline as the unbounded arm.
+- **What the pass does per benchmark:** `rus`/`ipe` hold a **pure-idle** carried wire
+  (the loop body touches only ancillas), so the wire is an untouched register slot →
+  provable identity → **refresh**, which has a register-threaded rewrite → the cut
+  fires (it re-prepares the ideal state and clears the idle T1/T2 decoherence
+  accumulated over the hold; no leakage source needed, §11 no-go escaped). `qwalk`/
+  `ipe_project` (unknown, non-Clifford) → the cost model evaluates in-pipeline: on the
+  uniform-leak Eagle calib it selects **none** (migrate is not cost-positive there); on
+  the Heron calib (cheap partner edge) it selects **migrate**, which now has a
+  register-threaded rewrite (§13.3) → the cut **fires** (double SWAP, `applied=true`).
+  A genuine cost-model decision, made in-pipeline. Verified: at `lam=0` the applied cut
+  is a logical no-op (migrate matches the unbounded arm exactly), and the ping-pong
+  clears carrier leakage at `lam>0`.
+- **Remaining capability gap (not a requirement violation):** the **knit rewrite still
+  exists only for bare-qubit carries**; a register-threaded carry the cost model would
+  knit (only reachable via the force flag, never auto-selected) declines. Refresh and
+  migrate both have register-threaded rewrites. Register-threaded knit is future work.
 
-### 14.7 Out of scope
+### 14.7 Two-arm reporting (normative)
+
+The driver runs **two arms** of every benchmark through the identical compiled path and
+reports both. This is the compiled-execution reporting contract; it supersedes the §8.2
+three-arm (`unbounded`/`knit`/`refresh`) simulator table — the compiled arm executes
+only the strategy the pass actually selected, so alternate-strategy arms are not run.
+
+- **`purl`** — both passes active; the pass selects and lowers the cut.
+- **`unbounded`** — the *same* `@qjit` program with the two Purl passes **omitted** (no
+  cut); the carried wire is held for the full runtime trip count. The baseline the cut
+  is measured against, produced by the real compiler — only the passes differ.
+
+Both arms are compiled per `(lam, seed)` and executed with one-shot trajectory
+averaging. The program returns `(expval, trip_counter)`: the `expval` is averaged over
+shots to a scalar (seed-std across seeds gives the error bar), while the classical
+`trip_counter` returns as a per-shot array, recovering the runtime iteration count.
+
+For each `(benchmark, lam)` the eval reports, **for both arms**:
+- delivered `<O>` (mean ± seed-std) and `ideal`;
+- `infidelity = |mean − ideal|` (delivered-expectation error) and
+  `RMSE = sqrt(infidelity² + seed-std²)` (bias + statistical, §8.2.1(1));
+- runtime coherent depth in iterations `min / mean / max` (from the per-shot trip
+  counter; noise-independent for a target-independent herald, noise-dependent for a
+  measurement-driven stop).
+
+Per benchmark (compile-time, `purl` arm), parsed from the in-pipeline IR:
+- `strategy` (+ applied), `C`, `bounded_cap = C` iterations (the coherent-depth cap the
+  cut guarantees, to be read against the unbounded arm's `mean` iterations, §8.2.1(3)),
+  and `pass-predicted F(bounded)`.
+
+And the decision-quality pair (§8.2.1(4)):
+- `best_arm` = min-RMSE arm; `regret = RMSE(purl) − RMSE(best_arm)` (`0` when the pass
+  chose the better arm).
+
+The KNIT sampling-cost family (§8.2.1(2)) is reported only when the selected strategy is
+`knit` (n/a otherwise — the compiled arm runs only the selected strategy). Results are
+written to `results/suite_<hw>.txt` and a companion CSV.
+
+### 14.8 Out of scope
 
 A Python device path (Catalyst compiled execution is C++-device only); changing the §5
 noise model (the C++ device mirrors it, validated against `sim/qsim.py`). The
-register-threaded migrate/knit rewrite is **not** out of scope — it is required future
-work for the cut to fire on unknown register carries (above).
+register-threaded **migrate** rewrite is now implemented (§13.3); the register-threaded
+**knit** rewrite remains future work (knit is never auto-selected, only force-flagged).

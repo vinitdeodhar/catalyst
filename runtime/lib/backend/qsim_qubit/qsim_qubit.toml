@@ -16,6 +16,7 @@ RY       = { properties = [ "invertible", "controllable" ] }
 RZ       = { properties = [ "invertible", "controllable" ] }
 PhaseShift = { properties = [ "invertible", "controllable" ] }
 CNOT     = { properties = [ "invertible" ] }
+SWAP     = { properties = [ "invertible" ] }
 CZ       = { properties = [ "invertible" ] }
 CRX      = { properties = [ "invertible" ] }
 CRY      = { properties = [ "invertible" ] }
