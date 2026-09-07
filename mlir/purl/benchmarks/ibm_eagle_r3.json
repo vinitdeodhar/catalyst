@@ -1,5 +1,5 @@
 {
- "device": "ibm_eagle_r3 (representative published medians)",
+ "device": "ibm_eagle_r3 (representative published medians; ECR 2q)",
  "n_qubits": 127,
  "gate_1q_time": 3.2e-08,
  "gate_2q_time": 5.6e-07,

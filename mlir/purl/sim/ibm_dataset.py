@@ -31,7 +31,7 @@ import warnings
 
 N_QUBITS = 127
 
-# --- published Eagle r3 medians (SI units: seconds; probabilities) ---
+# --- published Eagle r3 medians (SI units: seconds; probabilities). ECR 2q gate. ---
 MED = {
     "T1": 250e-6, "T2": 150e-6,
     "gate_1q_time": 32e-9, "gate_1q_err": 2.5e-4,
@@ -41,13 +41,35 @@ MED = {
     "p_prep": 1e-3,         # state-preparation error (reset+init)
 }
 
-# Published IBM leakage estimate (per 2q gate) -- IBM does not publish leakage as a
-# standard property (Eagle characterizations report ~0.1-0.3% per two-qubit gate);
-# used as the generator's default `leak_2q_default` written into the JSON (spec 4.1).
+# --- Heron r2 representative medians (SI units). Tunable-coupler CZ 2q gate. These
+# gate/coherence numbers track IBM's PUBLISHED Heron r2 calibration (ibm_fez /
+# ibm_marrakesh class, 2024-2025): faster + far cleaner 2q gates than Eagle. Only
+# leakage is NOT from these -- see IBM_LEAK_PER_2Q below (an estimate). ---
+MED_HERON = {
+    "T1": 250e-6, "T2": 180e-6,
+    "gate_1q_time": 32e-9, "gate_1q_err": 2.0e-4,
+    "gate_2q_time": 68e-9, "gate_2q_err": 3.0e-3,   # CZ median ~3e-3 (best edges ~1e-3)
+    "readout_time": 1.2e-6, "readout_err": 1.0e-2,
+    "tau": 1.0e-6,
+    "p_prep": 1e-3,
+}
+
+# Per-2q-gate leakage ESTIMATE. IBM does NOT publish leakage for ANY device (Eagle or
+# Heron); transmon CZ/CR leakage is characterized only in research papers, ~1e-3 order.
+# So this is a literature-order estimate, NOT vendor calibration, and it is identical
+# across Eagle/Heron JSONs (we have no device-specific leakage source). Recorded with
+# provenance in `leak_source`; the gate/coherence numbers above are the real ones.
 IBM_LEAK_PER_2Q = 1e-3
 
 _HERE = os.path.dirname(__file__)
 JSON_PATH = os.path.join(_HERE, os.pardir, "benchmarks", "ibm_eagle_r3.json")
+HERON_JSON_PATH = os.path.join(_HERE, os.pardir, "benchmarks", "ibm_heron_r2.json")
+# hardware name -> (medians, device label, json path) for the eval's --hardware switch
+HARDWARE = {
+    "eagle": (MED, "ibm_eagle_r3 (representative published medians; ECR 2q)", JSON_PATH),
+    "heron": (MED_HERON, "ibm_heron_r2 (representative published medians; CZ 2q)",
+              HERON_JSON_PATH),
+}
 
 
 def _spread(median, idx, rel=0.35):
@@ -90,7 +112,9 @@ def _heavy_hex_edges(n=N_QUBITS):
     return edges
 
 
-def build(seed_median=MED, leak_2q_default=IBM_LEAK_PER_2Q, leak_spread=0.0):
+def build(seed_median=MED, leak_2q_default=IBM_LEAK_PER_2Q, leak_spread=0.0,
+          device="ibm_eagle_r3 (representative published medians)",
+          partner_edge_leak=None, carry_qubit=0):
     qubits = []
     for i in range(N_QUBITS):
         qubits.append({
@@ -109,9 +133,14 @@ def build(seed_median=MED, leak_2q_default=IBM_LEAK_PER_2Q, leak_spread=0.0):
         }
         if leak_spread > 0.0:              # optional per-edge leakage spread (spec 4.1)
             e["leak_2q"] = round(_spread(leak_2q_default, j + 200, rel=leak_spread), 6)
+        # optional hand-set CHEAP partner edge on the carry qubit (a what-if lever,
+        # NOT vendor data): edges incident to `carry_qubit` get `partner_edge_leak`,
+        # so the pass's pair selection can pick a low-leakage SWAP edge.
+        if partner_edge_leak is not None and (a == carry_qubit or b == carry_qubit):
+            e["leak_2q"] = partner_edge_leak
         edge_list.append(e)
     return {
-        "device": "ibm_eagle_r3 (representative published medians)",
+        "device": device,
         "n_qubits": N_QUBITS,
         "gate_1q_time": seed_median["gate_1q_time"],
         "gate_2q_time": seed_median["gate_2q_time"],
@@ -127,11 +156,39 @@ def build(seed_median=MED, leak_2q_default=IBM_LEAK_PER_2Q, leak_spread=0.0):
     }
 
 
-def build_json(path=JSON_PATH, leak_2q_default=IBM_LEAK_PER_2Q, leak_spread=0.0):
-    data = build(leak_2q_default=leak_2q_default, leak_spread=leak_spread)
+def build_json(path=JSON_PATH, leak_2q_default=IBM_LEAK_PER_2Q, leak_spread=0.0,
+               seed_median=MED,
+               device="ibm_eagle_r3 (representative published medians)",
+               partner_edge_leak=None, carry_qubit=0, leak_source=None):
+    data = build(seed_median=seed_median, leak_2q_default=leak_2q_default,
+                 leak_spread=leak_spread, device=device,
+                 partner_edge_leak=partner_edge_leak, carry_qubit=carry_qubit)
+    if leak_source is not None:
+        data["leak_source"] = leak_source
     with open(path, "w") as fh:
         json.dump(data, fh, indent=1)
     return path
+
+
+# Heron leakage model (spec-directed what-if): body per-2q leakage 3e-3 with a hand-set
+# CHEAP 1e-4 partner edge on the carry qubit. Both are ESTIMATES/levers, not vendor data
+# (IBM publishes no leakage); the 1e-4 edge is deliberately optimistic (30x below body).
+HERON_LEAK_DEFAULT = 3e-3
+HERON_PARTNER_EDGE_LEAK = 1e-4
+_HERON_LEAK_SOURCE = (
+    "estimate + what-if: body p_leak=3e-3 (literature-order), carry-qubit partner edge "
+    "leak_2q=1e-4 (hand-set clean SWAP edge, NOT vendor data)")
+
+
+def build_hardware(name, carry_qubit=0):
+    """Write the JSON for a named hardware profile ('eagle' or 'heron')."""
+    medians, device, path = HARDWARE[name]
+    if name == "heron":
+        return build_json(path=path, seed_median=medians, device=device,
+                          leak_2q_default=HERON_LEAK_DEFAULT,
+                          partner_edge_leak=HERON_PARTNER_EDGE_LEAK,
+                          carry_qubit=carry_qubit, leak_source=_HERON_LEAK_SOURCE)
+    return build_json(path=path, seed_median=medians, device=device)
 
 
 def load(path=JSON_PATH):
@@ -200,13 +257,14 @@ def carried_calib(qubit=0, path=JSON_PATH):
 
 
 if __name__ == "__main__":
-    p = build_json()
-    d = load(p)
-    print(f"wrote {p}: {d['n_qubits']} qubits, {len(d['edges'])} edges")
-    print(f"median 2q err = {_median_2q_err(d):.4f}, "
-          f"leak_2q_default = {d['leak_2q_default']}, "
-          f"median leak = {_median_leak(d)}")
-    c = carried_calib(0)
-    print("carried qubit 0 calib:")
-    for k in ("T1", "T2", "p1", "p2", "p_ro", "gate_2q", "readout", "tau", "p_leak"):
-        print(f"  {k} = {c[k]}")
+    for name in ("eagle", "heron"):
+        p = build_hardware(name)
+        d = load(p)
+        print(f"[{name}] wrote {os.path.basename(p)}: {d['n_qubits']} qubits, "
+              f"{len(d['edges'])} edges")
+        print(f"  median 2q err = {_median_2q_err(d):.4f}, "
+              f"leak_2q_default = {d['leak_2q_default']} (estimate), "
+              f"median leak = {_median_leak(d)}")
+        c = carried_calib(0, path=p)
+        print("  carried qubit 0:", {k: round(c[k], 9) for k in
+              ("T1", "T2", "p2", "gate_2q", "p_leak")})

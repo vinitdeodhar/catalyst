@@ -728,12 +728,8 @@ state `|psi0> = H T H T H |0>`, and return `qml.expval(PauliZ(target))`.
 
 | Name | p | coin gate set | Role |
 |---|---|---|---|
-| `rus_rx_ibm` | 5/8 | Toffoli-sandwich (multi-control, **non-Clifford**) | primary; IBM-tutorial RUS shape (2 controls + 1 held target) |
-| `rus_chain(N)` | 5/8 / stage | Toffoli per stage | N sequential RUS gates on one held data qubit (N ∈ {1,2,4,8}) |
 | `rus_lowp` | 0.1 | **CNOT-heralded** (Clifford + CNOT ancilla; identity on the target on failure) | low-p heavy-tail regime (quantum-repeater / heralded memory); mean trip count 10 — where cutting is meant to help |
-| `pump` | 0.1 | **CNOT-sandwich ×3** (Clifford; identity on the held data each iteration; **6 two-qubit gates/iter**) | entanglement-pumping proxy (§6.1); leakage-heavy carry — the primary consumer of the per-2q leakage model (§4.1) |
 | `ipe_project` | ~0.12 / ~0.45 | **controlled-Rz(θ)** (non-Clifford; each round partially projects the carried superposition — the carried state is **outcome-dependent**) | phase-estimation-as-projection (§6.3); the **knit-only** benchmark (refresh is *unsound in principle*), with a refresh falsification arm |
-| `rus_data` | ~5/8 | **Paetznick–Svore RUS `V3`** (non-Clifford synthesis applied to arbitrary program *data*; identity-on-failure) | knit-only via the *cited protocol's own* non-Clifford data premise (§6.5); cleanest delivered-fidelity metric (fixed ideal `V3|ψ⟩`, no per-shot reference) |
 
 Most hold the same magic-state input and identical carried-qubit *physics*; they
 differ in the trip distribution (`p`), stage count (`N`), the 2q-gate load per
@@ -745,100 +741,14 @@ which §3.4 cannot prove, so they fall back to KNIT/NONE. Expected pass outcomes
 
 | benchmark | purl.class | purl.known_state | expected purl.strategy |
 |---|---|---|---|
-| `rus_rx_ibm` | carry | unknown | **none** (thin p=5/8 tail, §11; knit only if its window is non-empty and profitable) |
-| `rus_chain(N)` | carry | unknown | none / knit per stage |
 | `rus_lowp` | carry | identity | **refresh** — the headline positive result (§11, S2) |
-| `pump` | carry | identity | **refresh** (window `[1,2]`; leakage-clearing gain, §6.1) |
 | `ipe_project` (faithful) | carry | unknown | **none** (knit window empty, `C_min≈24 > C_max`; §6.3) |
 | `ipe_project_fast` | carry | unknown | **knit** — the knit-arm positive result (non-empty window at p≈0.45, B≈4, f=0.15; §6.3) |
-| `rus_data` | carry | unknown | **knit** where the window is non-empty (`C_min≈4` at p≈5/8), else **none**; never refresh (§6.5) |
 
 Note (roadmap): the **migrate** strategy (§13) supersedes knit as the cost model's
 choice for `unknown` states. Once §13 lands, the `unknown` rows above become **migrate
 or none** (knit stays reachable only via the force flag); the `known_state`/refresh rows
 are unchanged.
-
-### 6.1 `pump` — entanglement-pumping proxy
-
-**What it models.** Entanglement pumping repeatedly attempts a purification round
-against one held quantum resource until a herald succeeds, so the held resource
-ages through a *geometric* number of two-qubit-gate-heavy rounds — exactly Purl's
-carry shape. Two properties the other benchmarks lack: (a) each iteration charges
-**many** 2q gates to the held wire, so **leakage** (charged per 2q gate, §4.1)
-becomes a first-order term rather than a sliver — `pump` is the primary consumer of
-the per-gate leakage model; and (b) the protocol family is *canonical* (a named,
-citable purification/pumping lineage, §6.2) rather than constructed. The held wire
-is a **single-qubit proxy** for the true two-qubit resource — the same
-simplification `rus` already uses, and it must be described as such in the paper.
-
-**Definition.** Two lockstep artifacts (a `@qjit` program lowered to MLIR + a Python
-mirror). *Held wire `d`*: prepared once, before the loop, in
-`|psi0> = H T H T H |0>` (identical to `rus`, ideal `<Z>=0.5`); never measured in
-the loop. *Ancilla `a`*: reset and reused every iteration (fixed register, no
-per-iteration allocation). Body, per iteration:
-1. **Coin.** Reset `a`, then `Ry(theta)` on `a`, with `theta` chosen so the success
-   probability is exactly `p = 0.1` (mean 10 trips, matching `rus_lowp` for
-   comparability).
-2. **Entangling block ×3** (6 two-qubit gates/iteration): `CNOT(a→d)`, `S(a)`,
-   `CNOT(a→d)`. The sandwich decouples exactly — on the `a=|0>` branch the data wire
-   is untouched, and on the `a=|1>` branch the second CNOT undoes the first kick — so
-   the net action on `d` is the **identity** and the measurement outcome is provably
-   independent of the data state. All gates are Clifford, so §3.4 certifies identity.
-3. **Measure `a`.** Success exits the loop, failure repeats.
-
-Output `qml.expval(PauliZ(d))`. Target body depth `B ≈ 12` gate layers (the 6 2q
-gates dominate); **report the exact computed `B` in the results, do not force it**.
-
-**Expected pass behavior (assert, do not assume).** `purl.class = carry` (single
-carry slot); `purl.known_state = identity` — the Clifford sandwich is the point, so
-an `unknown` result means the analysis has a bug or the benchmark deviated from the
-definition above; **refresh** with window `[1, C_max]`, and with `B≈12` expect
-`C_max = C = 2` as in `rus_lowp`; KNIT stays inadmissible at `p=0.1` (variance floor
-near 29).
-
-**Evaluation.** Standard configuration (§8.3: 6000 shots, 8 seeds,
-`lam∈{0,0.25,0.5,1,2,4}`), arms **unbounded** and **refresh**, delivered fidelity by
-3-basis tomography against `|psi0>`, plus the RMSE/depth columns as for the other
-benchmarks. Two runs beyond the standard sweep:
-1. **Zero-leakage ablation** — an identical run with leakage set to zero (variant
-   JSON, §4.1). The gap between the refresh gains of the two runs is the **measured
-   leakage-clearing component**, reported explicitly.
-2. **Leakage sweep** — leakage ∈ {1e-4, 1e-3, 1e-2} via variant calibration files
-   (`eval/variants.py`, §5.1), reporting refresh gain and predicted↔measured
-   agreement at each point.
-
-**Acceptance.** (1) The expected-behavior assertions hold on the **real lowered IR**.
-(2) Refresh gain at nominal noise **exceeds the `rus` gain** (the leakage-heavy coin
-should decohere the unbounded arm faster) — report the number, whatever it is. (3)
-The ablation cleanly separates age-capping from leakage-clearing, and
-predicted↔measured stays within the **S3 0.02 criterion** at nominal noise across the
-leakage sweep.
-
-**Out of scope.** Two-qubit held states (true pairs), seepage, per-edge leakage
-placement studies, and any change to the coin's success-probability model.
-
-### 6.2 `pump` citations (verify before use)
-
-For the paper's benchmark description. Best-effort; **verify every entry against the
-published record before adding to the bibliography** — author lists and page numbers
-must be checked, and DOIs omitted rather than guessed.
-
-- Bennett, Brassard, Popescu, Schumacher, Smolin, Wootters. *Purification of Noisy
-  Entanglement and Faithful Teleportation via Noisy Channels.* Phys. Rev. Lett.
-  **76**, 722 (1996). — origin of entanglement purification.
-- Deutsch, Ekert, Jozsa, Macchiavello, Popescu, Sanpera. *Quantum Privacy
-  Amplification and the Security of Quantum Cryptography over Noisy Channels.* Phys.
-  Rev. Lett. **77**, 2818 (1996). — the standard two-way purification protocol.
-- Dür, Briegel, Cirac, Zoller. *Quantum repeaters based on entanglement
-  purification.* Phys. Rev. A **59**, 169 (1999). — entanglement *pumping*
-  specifically: the repeated-attempt loop against one held pair this benchmark
-  proxies.
-- Briegel, Dür, Cirac, Zoller. *Quantum Repeaters: The Role of Imperfect Local
-  Operations in Quantum Communication.* Phys. Rev. Lett. **81**, 5932 (1998). —
-  already in the paper's bibliography as `briegel1998repeaters`; **reuse the key**.
-- Kalb, Reiserer, Humphreys, et al. *Entanglement distillation between solid-state
-  quantum network nodes.* Science **356**, 928 (2017). — experimental demonstration
-  that held-resource purification loops are real practice, not theory alone.
 
 ### 6.3 `ipe_project` — phase estimation as eigenstate projection
 
@@ -938,98 +848,6 @@ bibliography**, and omit DOIs rather than guess.
   small-scale (noisy) experiments.* New J. Phys. **21**, 023022 (2019). — IPE under
   realistic noise (practice anchor).
 
-### 6.5 `rus_data` — RUS gate synthesis applied to program data
-
-**What it models & why (spec role).** `rus_data` runs the *original* repeat-until-
-success setting of Paetznick–Svore: a synthesized **non-Clifford** rotation applied to
-an **arbitrary program state** mid-computation. The carried qubit is the algorithm's
-own data, prepared through non-Clifford gates, so the known-state analysis must return
-`unknown` and refresh is unsound within Purl's framework. This gives a **knit-only**
-benchmark whose unknown-ness is the *cited protocol's own premise* — more legitimate
-than `ipe_project`'s constructed projection and far more than an unknown-state pump
-variant. Its delivered-fidelity metric is the **cleanest** of any knit benchmark:
-because failure is identity, the ideal final state `V3|ψ⟩` is fixed (trip-count
-independent), so **no per-shot reference** is needed (unlike §6.3).
-
-**Nuance to preserve (comments + paper).** Here the carried state happens to be
-**constant** across iterations (the failure branch is identity on data), so a
-*clairvoyant* compiler could refresh. Purl declines because it **cannot certify a
-non-Clifford state**, and in the protocol's intended use the data is arbitrary
-mid-algorithm state, so **no** compiler could. So `rus_data` also demonstrates that
-`unknown` is the analysis being conservative **exactly where the literature says it
-must be** — not a limitation, the correct answer.
-
-**Definition.** Two lockstep artifacts (a `@qjit` program lowered to MLIR + a Python
-mirror). *Data wire `d`* prepared once before the loop in a generic non-Clifford state
-`|ψ⟩ = Rz(0.7) Ry(0.4)|0⟩` (arbitrary fixed angles, well away from every stabilizer
-state); never measured in the loop. *Ancilla register*: reset and reused each
-iteration, fixed allocation. Body per iteration: the **Paetznick–Svore RUS circuit for
-the axial rotation `V3`** (the `(I + 2iZ)/√5` family member). **TRANSCRIBE THE CIRCUIT
-FROM THE PUBLISHED PAPER** — do not reconstruct from memory or secondary sources — and
-record the figure/equation number in a code comment. Properties (assert, do not
-assume): success branch applies `V3` (non-Clifford) to `d` and exits; failure branch
-applies identity to `d` up to a known Pauli/Clifford correction (the body applies it
-before repeating), so the carried state at every iteration boundary equals `|ψ⟩`;
-per-attempt success probability (expected ≈ 5/8) measured at `lam=0` and **pinned
-against the paper's stated value**. Output: 3-basis tomography of `d` after the loop
-against the classically computed ideal `V3|ψ⟩`. Report the computed body depth `B`
-(do not force it); the published circuit is shallow with a small `n2q` (expected 2–4)
-— record the exact count and use it consistently in the cost-model parity check.
-
-**Configurations.**
-- **`rus_data` (faithful)** — the circuit as published, standard coherence fraction
-  `f`. Compute the window against the deployed calibration at build time; with `p≈5/8`,
-  `C_min≈4`. If `C_min > C_max` this is a **negative control** (strategy NONE) and the
-  fast config carries the knit result; if the window is already non-empty, **one config
-  suffices** and the fast config is dropped. Decide from the computed numbers.
-- **`rus_data_fast` (only if needed)** — raise `f` first (as in §6.3), before touching
-  anything about the circuit. **Never alter the published body to open the window.**
-
-Run both against the nominal calibration and the **elevated-leakage variant** (`1e-2`,
-§4.1): with only ~2% of shots reaching a cut, the gain is measurable only where the
-harvestable pool is large.
-
-**Expected pass behavior (assert, do not assume).** `class=carry` (single slot) in all
-configs; `known_state=unknown` (the non-Clifford preparation must defeat the tableau —
-anything else is a bug); **no refresh** anywhere; `strategy=knit` where the window is
-non-empty, `none` where it is not, with decision attributes emitted for audit either
-way. The **existing periodic knit rewrite is used as-is** — this benchmark needs *no*
-estimator or scheduling changes (independent of the §12 levers).
-
-**Evaluation.** Standard sweep (§8.3), arms **unbounded** and **knit**, fidelity against
-`V3|ψ⟩`, RMSE/depth columns as elsewhere, predicted↔measured at nominal noise for the
-selected strategy. Additionally report the **fraction of shots receiving ≥1 cut** and
-`E[#cuts]` — the thin `p≈5/8` tail is the explanation a reader needs for the gain's
-size. Leakage sweep {1e-4, 1e-3, 1e-2} via variant files, reporting the knit gain at
-each point; the claim under test is that the gain **scales with leakage**, not that it
-is large.
-
-**Acceptance.** (1) The expected-behavior assertions hold on the **real lowered IR** for
-every config. (2) The transcription gates (unitary + probability) pass. (3) Where knit
-fires, the elevated-leakage gain over unbounded is **positive with non-overlapping seed
-error bars** and **monotone** across the leakage sweep, while near-zero leakage makes it
-statistically indistinguishable from zero (the no-go, observed). (4) predicted↔measured
-within the **S3 0.02** criterion at nominal noise for the selected strategy. (5) The
-cut-fraction and `E[#cuts]` figures are reported alongside the gain, whatever its size —
-**no tuning toward a target**.
-
-**Out of scope.** Bocharov-style multi-stage ladders (separate benchmark if
-commissioned); changing the published circuit, its success probability, or the
-correction rule; multi-qubit data states; seepage; the γ=3 decomposition; the LRU
-scrub; the §12 knit levers (this benchmark lands against the current knit
-implementation).
-
-### 6.6 `rus_data` citations (verify before use)
-
-Both already in the bibliography; **verify page-level details** before any paper edit.
-
-- `paetznick2014rus` — the protocol itself, the identity-on-failure property, and the
-  published circuit this benchmark **transcribes**.
-- `bocharov2015rus` — the family context (efficient RUS synthesis), cited as the
-  generalization, **not run** here.
-
----
-
 ## 7. Unit tests (FileCheck / lit)
 
 Under `mlir/test/Quantum/Purl/`, run by lit / `check-dialects`:
@@ -1041,16 +859,10 @@ Under `mlir/test/Quantum/Purl/`, run by lit / `check-dialects`:
   `known_state_unprovable` (→ knit fallback) — the proof + refresh rewrite.
 - `tier1_detect` / `profit_none` / `tier3_unknown` — the 3.5 strategy selection.
 - `ibm_fidelity` — the per-qubit dataset drives `purl.predicted_fidelity`.
-- `pump_refresh` (§6.1) — the 3-block CNOT-sandwich body classifies **carry**,
-  proves **identity**, and receives the **refresh** rewrite.
 - `ipe_project_unknown` (§6.3) — the controlled-`Rz` body classifies **carry** and
   returns **`unknown`**; **no refresh rewrite** occurs.
 - `ipe_project_knit` (§6.3) — the fast-config shape receives the **knit** rewrite
   (guard, weight carry, `purl.renew` with axis, expval legalization).
-- `rus_data_unknown` (§6.5) — the Paetznick–Svore `V3` body classifies **carry** and
-  returns **`unknown`** (non-Clifford data); **no refresh rewrite**.
-- `rus_data_knit` (§6.5) — the config with a non-empty window receives the **knit**
-  rewrite (guard, weight carry, `purl.renew`, expval legalization).
 
 Each asserts the relevant `purl.*` attributes and, for rewrites, the transformed
 structure (carry extension, guard, cut expansion / reset+re-prep, output).
@@ -1062,22 +874,7 @@ the collapsed eigenstate on every noiseless shot; a window-math unit test pins
 `C_min`/`C_max` for both configs on the deployed calibration (empty for faithful,
 non-empty for fast).
 
-Simulator/model gates for `pump` (in the §5 validation harness, not FileCheck): at
-`lam=0` the mirror reproduces `<Z>=0.5` exactly; the pass's per-iteration `n2q = 6`
-matches the mirror's leakage charging (a one-iteration parity check); fixed seeds
-reproduce the run byte-for-byte.
 
-Simulator/model gates for `rus_data` (§5 validation harness, not FileCheck): a
-**transcription** gate — at `lam=0` the failure branch composed with its correction
-equals the identity on `d` over a basis of inputs, and the success branch equals `V3`
-up to global phase (this pins the transcription); a **probability** gate — the
-measured `lam=0` success probability matches the paper's stated value within
-statistical error; a **fidelity** gate — `lam=0` delivered fidelity is **1.0** within
-statistics against the fixed ideal `V3|ψ⟩` (no per-shot reference); a **parity** gate —
-the pass's `n2q` matches the mirror's per-iteration leakage charging; and a
-window-math unit test pinning empty/non-empty for both configs on the deployed calib.
-
----
 
 ## 8. The end-to-end eval script
 
@@ -1242,7 +1039,7 @@ purl/
     tests/*.mlir      # FileCheck tests (§7): insertion and lowering, run by lit
   sim/             # NumPy simulator (reads the shared JSON)
     qsim.py  knit_runtime.py  fast_target.py  ibm_dataset.py  validate.py
-  benchmarks/      # rus_rx_ibm / rus_chain / rus_lowp: @qjit program + mirror
+  benchmarks/      # rus_lowp / ipe / qwalk / ipe_project: @qjit program + mirror
     *.py  ibm_eagle_r3.json
   eval/
     e2e.py         # the end-to-end pipeline + table (§8)
@@ -1290,7 +1087,7 @@ variance window caps the cut-touched shot fraction near 5%, so these are graded 
 **correctness and variance reduction**, with the fidelity delta reported *whatever it
 is* (do not tune toward a target). Constraints that hold across all three: γ stays 4
 and `V_max` stays 4 (the γ=3 classically-communicated decomposition is **out of
-scope**, §12.5); **no lever may change refresh behavior** — `rus`/`ipe`/`pump`
+scope**, §12.5); **no lever may change refresh behavior** — `rus`/`ipe`
 refresh runs must reproduce published numbers byte-identically under fixed seeds
 (regression gate).
 
@@ -1553,7 +1350,7 @@ unknown+cost-positive→migrate; knit never selected without the force flag).
 ### 13.7 Evaluation
 
 **Regression:** full refresh sweeps of `rus`/`ipe`, byte-identical (fixed seeds).
-**Migrate headline:** `ipe_project` (both configs) and `rus_data` under the new
+**Migrate headline:** `ipe_project` (both configs) under the new
 procedure, standard sweep (§8.3), nominal + elevated-leakage (`1e-2`) variants, arms
 **unbounded** and **migrate**; report fidelity, RMSE, depth, `E[#migrations]`,
 predicted↔measured. Note the qualitative change: the faithful `ipe_project` config
@@ -1572,8 +1369,6 @@ error class at γ=1 vs γ²=16** — the paper's central migrate figure.
   procedure decides ({migrate or none, migrate}); the **falsification arm** (forced
   refresh collapses fidelity) is unchanged and still required; its knit FileCheck moves
   to the force flag.
-- **§6.5 `rus_data`** — same substitution; the benchmark's purpose (unknown by the
-  protocol's own premise) is unaffected.
 - **§12 knit levers** — unaffected in content but the levers now apply only to
   **force-knit** experiments; do **not** schedule §12 ahead of this section.
 

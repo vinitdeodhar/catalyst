@@ -19,9 +19,21 @@ per-2q-gate leakage is zero and the pass selects NONE.
 import numpy as np
 
 from sim.qsim import QSim
-from benchmarks.rus_rx_ibm import (  # noqa: F401  (shared carried-qubit model)
-    N_WIRES, TARGET, ANCILLAS, Z_IDEAL, prepare_input,
-)
+
+# carried-qubit model (formerly shared with rus_rx_ibm, now inlined): wire 0 holds
+# the non-Clifford magic state |psi0> = H T H T H |0> (ideal <Z> = 0.5); wires 1-3
+# are the coin ancillas, measured + reset each attempt.
+N_WIRES = 4
+TARGET = 0
+ANCILLAS = (1, 2, 3)
+Z_IDEAL = 0.5
+
+
+def prepare_input(sim):
+    """Program input state on the carried target: magic state H T H T H |0>."""
+    q = TARGET
+    sim.h(q); sim.t(q); sim.h(q); sim.t(q); sim.h(q)
+
 
 # heralding success probability per attempt (low: repeater / heralded regime)
 P_LOWP = 0.1

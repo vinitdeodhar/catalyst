@@ -1,7 +1,0 @@
-benchmark,lam,p,C_knit,C_refresh,B_layers,depth_per_iter,min_iters,mean_iters,max_iters,runtime_depth,bounded_cap_layers,fidelity_unbounded,fidelity_knit,fidelity_refresh,std_knit,std_refresh,knit_admissible,rmse_unbounded,rmse_refresh,delta_rmse_ref_minus_unb,best_arm
-pump,0.0,0.1,,2,12,12,1,9.854,99,118.3,24,1.0,,0.9954,,0.0115,0,0.0125,0.0124,-0.0001,refresh
-pump,0.25,0.1,,2,12,12,1,9.993,108,119.9,24,0.9157,,0.9786,,0.0067,0,0.0847,0.0225,-0.0622,refresh
-pump,0.5,0.1,,2,12,12,1,9.941,104,119.3,24,0.8593,,0.9659,,0.0079,0,0.1411,0.035,-0.106,refresh
-pump,1.0,0.1,,2,12,12,1,9.93,113,119.2,24,0.7731,,0.9393,,0.0066,0,0.2274,0.061,-0.1664,refresh
-pump,2.0,0.1,,2,12,12,1,9.96,102,119.5,24,0.6894,,0.884,,0.0111,0,0.3107,0.1165,-0.1942,refresh
-pump,4.0,0.1,,2,12,12,1,10.04,105,120.5,24,0.6072,,0.7829,,0.005,0,0.393,0.2172,-0.1758,refresh

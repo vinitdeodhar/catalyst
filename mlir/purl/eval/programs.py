@@ -36,10 +36,10 @@ def _dev(wires, lam, shots, carry_qubit=0, calib=CALIB):
 
 # --- rus (= rus_lowp): held magic state |psi0>=H T H T H|0>, low-p CNOT herald.
 # Provable identity on the held wire -> the pass selects REFRESH. Ideal <Z> = 0.5.
-def rus(lam, seed, shots=1500, p=0.1, calib=CALIB):
+def rus(lam, seed, shots=1500, p=0.1, calib=CALIB, keep=False):
     dev = _dev(2, lam, shots, 0, calib)
 
-    @qjit(seed=seed)
+    @qjit(seed=seed, keep_intermediate=keep)
     @purl_lower_qcut
     @purl(calib=calib, p=p, shots=6000)
     @qml.qnode(dev, mcm_method="one-shot")
@@ -62,10 +62,10 @@ def rus(lam, seed, shots=1500, p=0.1, calib=CALIB):
 
 # --- ipe: held eigenstate |+>, adaptive herald loop. Provable identity -> REFRESH.
 # Ideal <X> = 1 (read via the returned PauliX expval).
-def ipe(lam, seed, shots=1500, p=0.12, calib=CALIB):
+def ipe(lam, seed, shots=1500, p=0.12, calib=CALIB, keep=False):
     dev = _dev(2, lam, shots, 0, calib)
 
-    @qjit(seed=seed)
+    @qjit(seed=seed, keep_intermediate=keep)
     @purl_lower_qcut
     @purl(calib=calib, p=p, shots=6000)
     @qml.qnode(dev, mcm_method="one-shot")
@@ -93,10 +93,10 @@ def ipe(lam, seed, shots=1500, p=0.12, calib=CALIB):
 _QW_RY, _QW_RZ = 0.4, 0.7
 
 
-def qwalk(lam, seed, shots=1500, p=0.5, calib=CALIB, max_trips=60):
+def qwalk(lam, seed, shots=1500, p=0.5, calib=CALIB, max_trips=60, keep=False):
     dev = _dev(3, lam, shots, 0, calib)  # 0=data, 1=sandwich ancilla, 2=walk coin
 
-    @qjit(seed=seed)
+    @qjit(seed=seed, keep_intermediate=keep)
     @purl_lower_qcut
     @purl(calib=calib, p=p, shots=6000)
     @qml.qnode(dev, mcm_method="one-shot")
@@ -135,11 +135,11 @@ _L01 = math.cos(_THETA / 4 + math.pi / 4) ** 2    # P(b=0 | eigenstate 1)
 
 
 def ipe_project(lam, seed, shots=1500, p=0.45, calib=CALIB, thresh=0.87,
-                max_trips=10):
+                max_trips=10, keep=False):
     dev = _dev(2, lam, shots, 0, calib)          # 0=data, 1=ancilla
     prior0 = math.cos(_ALPHA) ** 2
 
-    @qjit(seed=seed)
+    @qjit(seed=seed, keep_intermediate=keep)
     @purl_lower_qcut
     @purl(calib=calib, p=p, shots=6000)
     @qml.qnode(dev, mcm_method="one-shot")
@@ -182,3 +182,37 @@ def ipe_project(lam, seed, shots=1500, p=0.45, calib=CALIB, thresh=0.87,
 # migrate fires where a cheap partner edge makes it profitable). No benchmark names a
 # strategy or invokes a pass out-of-band.
 PROGRAMS = {"rus": rus, "ipe": ipe, "qwalk": qwalk, "ipe_project": ipe_project}
+
+
+def probe_strategy(builder, calib):
+    """Extract the PASS's decision from the real compiled pipeline (spec §8.2: the
+    eval must report the pass-selected strategy). Compiles the benchmark once with
+    keep_intermediate and reads purl.strategy / purl.C / purl.applied /
+    purl.predicted_fidelity from the post-QuantumCompilation IR (the passes' own
+    output in-pipeline -- not an out-of-band quantum-opt call). The decision depends
+    on p/calib, not lam/seed, so one probe per (benchmark, calib) suffices."""
+    import glob
+    import os
+    import re
+    import tempfile
+
+    d = tempfile.mkdtemp(prefix="purl_probe_")
+    cwd = os.getcwd()
+    os.chdir(d)
+    try:
+        f, _ = builder(lam=0.0, seed=0, shots=1, calib=os.path.join(cwd, calib),
+                       keep=True)
+        f()  # trigger compilation (dumps stage IR under ./<fn>/)
+        files = glob.glob(os.path.join(d, "*", "*AfterQuantumCompilationStage.mlir"))
+        text = open(files[0]).read() if files else ""
+    finally:
+        os.chdir(cwd)
+    strat = re.search(r'purl\.strategy = "([a-z]+)"', text)
+    C = re.search(r'purl\.C = (\d+)', text)
+    pred = re.search(r'purl\.predicted_fidelity = [^}]*bounded = ([0-9.eE+-]+)', text)
+    return {
+        "strategy": strat.group(1) if strat else "none",
+        "C": int(C.group(1)) if C else None,
+        "applied": "purl.applied = true" in text,
+        "predicted_bounded": float(pred.group(1)) if pred else None,
+    }

@@ -11,11 +11,11 @@ import sys
 import numpy as np
 
 from sim.qsim import QSim, DEFAULT_CALIB
-from benchmarks.rus_rx_ibm import run_unbounded, Z_IDEAL
+from benchmarks.rus_lowp import run_unbounded, Z_IDEAL, P_ANALYTIC
 
 
 def gate_i(rng, N=6000):
-    """lam=0: rus_rx_ibm p_hat = 0.625 +- 0.01; <Z> = Z_IDEAL (0.5) within stat."""
+    """lam=0: rus_lowp p_hat = 0.1 +- 0.01; <Z> = Z_IDEAL (0.5) within stat."""
     trips, zs = [], []
     for _ in range(N):
         k, z = run_unbounded(rng, lam=0.0)
@@ -24,9 +24,9 @@ def gate_i(rng, N=6000):
     p_hat = 1.0 / (sum(trips) / len(trips))
     mu = float(np.mean(zs))
     se = np.std(zs, ddof=1) / math.sqrt(N)
-    ok_p = abs(p_hat - 0.625) <= 0.01
+    ok_p = abs(p_hat - P_ANALYTIC) <= 0.01
     ok_z = abs(mu - Z_IDEAL) <= 3 * se
-    print(f"[gate i]  p_hat={p_hat:.4f} (0.625+-0.01)  ok={ok_p}")
+    print(f"[gate i]  p_hat={p_hat:.4f} ({P_ANALYTIC}+-0.01)  ok={ok_p}")
     print(f"[gate i]  <Z>={mu:+.4f} (ideal {Z_IDEAL:+.3f}, 3se={3*se:.3f})  ok={ok_z}")
     return ok_p and ok_z
 
@@ -49,9 +49,10 @@ def gate_ii(rng, N=8000):
     return ok
 
 
-def gate_m2(C=3, S=12000, seed=9):
-    """Cross-agreement at lam=0: direct ~ discard ~ knit within 3 sigma."""
-    import benchmarks.rus_rx_ibm as bench
+def gate_m2(C=30, S=12000, seed=9):
+    """Cross-agreement at lam=0: direct ~ discard ~ knit within 3 sigma. On rus_lowp
+    (p=0.1) knit is admissible only for C >= ~27 (16*(1-p)^C < 1), hence C=30."""
+    import benchmarks.rus_lowp as bench
     from sim.knit_runtime import cross_validate
     r = cross_validate(bench, C=C, lam=0.0, S=S, seed=seed, verbose=True)
     d, se_d = r["direct"]
@@ -119,44 +120,6 @@ def gate_leak():
     return ok
 
 
-def gate_pump():
-    """pump benchmark (spec 6.1): at lam=0 the mirror delivers <Z>=0.5 (the
-    CNOT-S-CNOT sandwich is net-identity on the held wire); the per-iteration 2q
-    count matches n2q=6 (parity with the pass); fixed seeds are byte-reproducible."""
-    import benchmarks.pump as pump
-
-    # lam=0: identity body -> <Z> = Z_IDEAL within statistics
-    zs = []
-    rng = np.random.default_rng(4242)
-    N = 6000
-    for _ in range(N):
-        _, z = pump.run_unbounded(rng, lam=0.0)
-        zs.append(z)
-    mu = float(np.mean(zs))
-    se = float(np.std(zs, ddof=1) / math.sqrt(N))
-    ok_z = abs(mu - pump.Z_IDEAL) <= 3 * se
-    print(f"[gate pump] lam=0 <Z>={mu:+.4f} (ideal {pump.Z_IDEAL}, 3se={3*se:.3f})  "
-          f"ok={ok_z}")
-
-    # n2q parity: the mirror charges exactly 6 two-qubit gates per iteration.
-    calls = {"n": 0}
-    sim = QSim(pump.N_WIRES, lam=1.0, rng=np.random.default_rng(1))
-    orig = sim.cnot
-    sim.cnot = lambda c, t: (calls.__setitem__("n", calls["n"] + 1), orig(c, t))[1]
-    pump.prepare_input(sim)
-    pump.attempt(sim)
-    ok_n2q = calls["n"] == pump.N2Q_PER_ITER == 6
-    print(f"[gate pump] per-iteration 2q gates={calls['n']} (n2q={pump.N2Q_PER_ITER})"
-          f"  ok={ok_n2q}")
-
-    # determinism: same seed -> identical trajectory
-    a = [pump.run_unbounded(np.random.default_rng(7), lam=1.0) for _ in range(3)]
-    b = [pump.run_unbounded(np.random.default_rng(7), lam=1.0) for _ in range(3)]
-    ok_det = a == b
-    print(f"[gate pump] fixed-seed determinism  ok={ok_det}")
-
-    return ok_z and ok_n2q and ok_det
-
 
 def gate_ipe_project():
     """ipe_project (spec 6.3): the knit-only projection benchmark. Checks the
@@ -166,9 +129,25 @@ def gate_ipe_project():
     estimator is unbiased at lam=0, (d) an invalid forced refresh collapses the
     fidelity, and (e) the knit window is empty (faithful) / non-empty (fast)."""
     import benchmarks.ipe_project as ip
-    from eval.run_eval import window
     from sim.ibm_dataset import carried_calib
     from sim.qsim import load_calib
+
+    def window(p, gamma2=16.0, f=0.05, vmax=4.0, calib=None):
+        """Cut-period window (C_min, C_max) -- inlined from the former run_eval.py.
+        C_min = smallest C with KNIT variance V(C)=(1-q)/(1-16q) <= vmax; C_max =
+        floor(f*T2/(B+tau)) coherence budget (C_min+2 in unit mode)."""
+        C_min = 1
+        while True:
+            q = (1.0 - p) ** C_min
+            V = float("inf") if gamma2 * q >= 1.0 else (1.0 - q) / (1.0 - gamma2 * q)
+            if V <= vmax or C_min > 100000:
+                break
+            C_min += 1
+        if calib is None or math.isinf(calib.get("T2", math.inf)):
+            C_max = C_min + 2
+        else:
+            C_max = int(f * calib["T2"] / (calib["readout"] * 3 + calib["tau"]))
+        return C_min, C_max
 
     # (a) lam=0 confident projection -> F near 1 (F = posterior confidence -> 1).
     rng = np.random.default_rng(31)
@@ -219,71 +198,6 @@ def gate_ipe_project():
 
     return ok_f0 and ok_match and ok_knit and ok_fals and ok_win
 
-
-def gate_rus_data():
-    """rus_data (spec 6.5): Paetznick-Svore V3 RUS on program data. FLAGGED best-
-    effort reconstruction -- these gates pin the V3 CHANNEL (not the paper's exact
-    gate circuit): (a) transcription -- the Kraus operators are M0=sqrt(5/8)V3 and
-    M1=sqrt(3/8)I (success = V3, failure = identity); (b) probability -- measured
-    success rate = 5/8; (c) fidelity -- lam=0 delivered fidelity 1.0 vs the fixed
-    ideal V3|psi>; (d) parity -- the pass n2q matches the mirror's per-iteration 2q
-    charging."""
-    import benchmarks.rus_data as rd
-
-    # (a) transcription: Kraus M0 = sqrt(5/8) V3, M1 = sqrt(3/8) I (channel-exact)
-    M0 = np.diag([rd.U0[0, 0], rd.U1[0, 0]])
-    M1 = np.diag([rd.U0[1, 0], rd.U1[1, 0]])
-    ok_m0 = np.allclose(M0, math.sqrt(5 / 8) * rd.V3)
-    ok_m1 = np.allclose(M1, math.sqrt(3 / 8) * np.eye(2))
-    print(f"[gate rus_data] Kraus M0==sqrt(5/8)V3 & M1==sqrt(3/8)I  "
-          f"ok={ok_m0 and ok_m1}")
-
-    # (b) probability: measured lam=0 success rate == 5/8
-    rng = np.random.default_rng(55)
-    trips = [rd.run_unbounded(rng, lam=0.0)[0] for _ in range(8000)]
-    p_hat = 1.0 / (sum(trips) / len(trips))
-    ok_p = abs(p_hat - rd.P_ANALYTIC) < 0.02
-    print(f"[gate rus_data] success p_hat={p_hat:.4f} (published {rd.P_ANALYTIC})  "
-          f"ok={ok_p}")
-
-    # (c) fidelity: lam=0 delivered 3-basis fidelity == 1.0 vs the FIXED ideal V3|psi>
-    def read(sim, q, basis):
-        if basis == "X":
-            sim.h(q)
-        elif basis == "Y":
-            sim.sdg(q); sim.h(q)
-        return 1 - 2 * sim.measure(q)
-    comp = {}
-    for basis in "XYZ":
-        vals = []
-        for i in range(12000):
-            s = QSim(rd.N_WIRES, lam=0.0, rng=np.random.default_rng(20000 + i))
-            rd.prepare_input(s)
-            k, fail = 0, True
-            while fail and k < 200:
-                fail = rd.attempt(s)
-                k += 1
-            vals.append(read(s, rd.DATA, basis))
-        comp[basis] = float(np.mean(vals))
-    a = np.array([comp["X"], comp["Y"], comp["Z"]])
-    F = 0.5 * (1.0 + float(a @ rd.IDEAL_BLOCH))
-    ok_fid = F >= 0.99
-    print(f"[gate rus_data] lam=0 delivered fidelity vs V3|psi> = {F:.4f} (>=0.99)  "
-          f"ok={ok_fid}")
-
-    # (d) parity: the mirror charges exactly N2Q_PER_ITER 2q gates per attempt
-    calls = {"n": 0}
-    s = QSim(rd.N_WIRES, lam=1.0, rng=np.random.default_rng(1))
-    orig = s.ctrl_branch
-    s.ctrl_branch = lambda c, t, U0, U1: (calls.__setitem__("n", calls["n"] + 1),
-                                          orig(c, t, U0, U1))[1]
-    rd.prepare_input(s)
-    rd.attempt(s)
-    ok_n2q = calls["n"] == rd.N2Q_PER_ITER == 1
-    print(f"[gate rus_data] per-iteration 2q gates={calls['n']} "
-          f"(n2q={rd.N2Q_PER_ITER})  ok={ok_n2q}")
-
-    return ok_m0 and ok_m1 and ok_p and ok_fid and ok_n2q
 
 
 def gate_migrate():
@@ -403,18 +317,13 @@ def main():
     print("MILESTONE 2:", "PASS" if ok2 else "FAIL")
     ok3 = gate_leak()
     print("LEAKAGE SCHEMA:", "PASS" if ok3 else "FAIL")
-    ok4 = gate_pump()
-    print("PUMP BENCHMARK:", "PASS" if ok4 else "FAIL")
     ok5 = gate_ipe_project()
     print("IPE_PROJECT BENCHMARK:", "PASS" if ok5 else "FAIL")
-    ok6 = gate_rus_data()
-    print("RUS_DATA BENCHMARK:", "PASS" if ok6 else "FAIL")
     ok7 = gate_migrate()
     print("MIGRATE STRATEGY:", "PASS" if ok7 else "FAIL")
     ok8 = gate_qwalk()
     print("QWALK BENCHMARK:", "PASS" if ok8 else "FAIL")
-    sys.exit(0 if (ok1 and ok2 and ok3 and ok4 and ok5 and ok6 and ok7 and ok8)
-             else 1)
+    sys.exit(0 if (ok1 and ok2 and ok3 and ok5 and ok7 and ok8) else 1)
 
 
 if __name__ == "__main__":
