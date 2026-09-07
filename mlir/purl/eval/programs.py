@@ -162,20 +162,23 @@ def ipe_project(lam, seed, shots=1500, p=0.45, calib=CALIB, thresh=0.87,
             return p0n, k + 1
 
         p0f, _ = loop(prior0, 0)
+
         # align the delivered wire to the shot's posterior winner: if winner==1
         # (p0<0.5) flip the Z-frame, so <Z> scores fidelity to |winner> (ideal +1)
-        cond(p0f < 0.5, lambda: qml.PauliX(0))()
+        @cond(p0f < 0.5)
+        def _align():
+            qml.PauliX(0)         # side effect only (both branches return None)
+
+        _align()
         return qml.expval(qml.PauliZ(0))
 
     return f, 1.0   # ideal <Z> = +1 (winner-aligned per-shot reference)
 
 
-# The active suite is rus + ipe (single carried slot -> refresh, fully supported
-# through the real Catalyst pipeline). qwalk and ipe_project are written above as
-# faithful @qjit programs, but their persistent ancilla wires present as MULTIPLE
-# carried register slots, which the pass rejects ("multi-wire cut unsupported", a
-# deliberate single-carry-slot limitation pinned by two_carry.mlir). Enabling them
-# needs either restructuring so only the data wire is carried, or extending the pass
-# to multi-slot carries. Kept here (not active) pending that.
-PROGRAMS = {"rus": rus, "ipe": ipe}
-BLOCKED = {"ipe_project": ipe_project, "qwalk": qwalk}  # pass: multi-slot unsupported
+# All four benchmarks are Python @qjit programs compiled through the ENTIRE Catalyst
+# pipeline with both purl passes active (spec §14 hard requirement). The pass decides
+# per program: rus/ipe (provable identity) -> refresh; qwalk/ipe_project (unknown) ->
+# the cost model selects (none where migrate is not cost-positive on the calibration;
+# migrate fires where a cheap partner edge makes it profitable). No benchmark names a
+# strategy or invokes a pass out-of-band.
+PROGRAMS = {"rus": rus, "ipe": ipe, "qwalk": qwalk, "ipe_project": ipe_project}

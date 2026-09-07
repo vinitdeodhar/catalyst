@@ -740,15 +740,21 @@ static LoopInfo classify(scf::WhileOp loop)
                 if (!slot)
                     return;
                 Slot s = classifyQubitLine(ex.getQubit());
-                // combine multiple extracts of one slot: CARRY dominates, then
-                // UNKNOWN, then RESET
+                // combine multiple extracts of one slot. A slot MEASURED on any line
+                // is a work/ancilla wire, not the carried data wire, even if a
+                // reset-correction branch (extract -> cond PauliX -> insert) re-inserts
+                // it un-measured -- so MEASURED (Unknown/Reset) dominates CARRY here.
+                // Precedence: Unknown > Reset > Carry. A true data carry is never
+                // measured in the body, so all its lines are Carry (dominates nothing).
                 auto it = slotState.find(*slot);
                 if (it == slotState.end())
                     slotState[*slot] = s;
-                else if (s == Slot::Carry || it->second == Slot::Carry)
-                    it->second = Slot::Carry;
                 else if (s == Slot::Unknown || it->second == Slot::Unknown)
                     it->second = Slot::Unknown;
+                else if (s == Slot::Reset || it->second == Slot::Reset)
+                    it->second = Slot::Reset;
+                else
+                    it->second = Slot::Carry;
             });
             for (auto &kv : slotState) {
                 anySlot = true;

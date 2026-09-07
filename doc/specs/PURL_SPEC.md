@@ -1607,13 +1607,20 @@ changes to refresh or to the knit lowering itself, the γ=3 decomposition.
 
 ## 14. Compiled-execution eval (benchmarks run through Catalyst on a noisy device)
 
-The §8 eval invokes `quantum-opt --purl` out-of-band and scores against the §5
-NumPy simulator's own executors. **§14 is the faithful eval**: each benchmark is a
-plain Catalyst `@qjit` program, **both Purl passes run inside the Catalyst lowering
-pipeline** (they select and lower the cut), and the program executes on a **noisy
-runtime device** that replaces `lightning.qubit` — so delivered fidelity under
-decoherence is measured *end to end through the real compiler*, with no side
-`quantum-opt` call, no Python circuit mirror, and no per-benchmark execution logic.
+**Hard requirement (normative).** Every benchmark **MUST** be authored as a plain
+Catalyst `@qjit` Python program and evaluated by compiling it through the **entire
+Catalyst lowering pipeline with both Purl passes active**, then executing it on the
+noisy runtime device. There is **no** out-of-band `quantum-opt --purl` invocation, **no**
+Python circuit mirror of the algorithm, **no** benchmark-specific call into the passes,
+and **no** benchmark that declares its own strategy — the pass *decides and lowers* the
+cut, the device applies the noise. A benchmark that cannot run this way is not a valid
+Purl benchmark. (This supersedes the older §8 flow, which invoked the pass out-of-band
+and scored against the §5 NumPy executors; §8 is retained only as a cross-check.)
+
+This is the faithful eval: each benchmark is a plain `@qjit` program, both Purl passes
+run inside the pipeline (they select and lower the cut), and it executes on a noisy
+runtime device replacing `lightning.qubit` — delivered fidelity under decoherence
+measured end to end through the real compiler.
 
 ### 14.1 Architecture — one uniform path
 
@@ -1675,23 +1682,34 @@ Add a `@qjit` builder to `eval/programs.py` returning `(program, ideal)` and reg
 it in `PROGRAMS`. No runner, no strategy declaration, no simulator wiring — the pass
 picks the strategy, the device applies the noise, the driver scores uniformly.
 
-### 14.6 Requirements, coverage, limitations
+### 14.6 Coverage and current capability
 
 - **Requires** the runtime device built (`make runtime` → `librtd_qsim_qubit.so`) and
   the Catalyst frontend.
-- **Single carried slot only.** The pass supports one carried quantum slot (§7
-  `two_carry`: `multi-wire cut unsupported`). Benchmarks whose bodies keep **persistent
-  ancilla wires** thread them as extra carried register slots and are rejected; only
-  the data wire may be a persistent carry (ancillas must be measured/transient each
-  iteration, as in `rus`/`ipe`). Benchmarks needing multiple persistent carries
-  (`ipe_project`, `qwalk` as written) are out of scope for this path until the
-  single-slot limitation is lifted; they remain runnable via the §8 / §5 executors.
-- **Register-threaded carry.** Real Catalyst IR threads the carry as `!quantum.reg`;
-  only the **refresh** rewrite has a register path today, so proven-state benchmarks
-  (`rus`, `ipe`) run fully; migrate/knit-on-register is future work.
+- **All four benchmarks comply** with §14: `rus`, `ipe`, `qwalk`, `ipe_project` are
+  Python `@qjit` programs that compile through the full pipeline (both passes active)
+  and run on the qsim device.
+- **A wire measured every iteration is NOT a carried data slot** (classifier, §3.1):
+  a benchmark may keep ancilla/work wires (measured + reset each iteration) — only an
+  un-measured through-wire is the data carry. This is what lets `qwalk`/`ipe_project`
+  (persistent sandwich/coin/posterior ancillas) present a single data carry. The `§7
+  two_carry` guard still fires only for **two genuine un-measured data carries**.
+- **What the pass does per benchmark:** `rus`/`ipe` (provable identity) → **refresh**,
+  which has a register-threaded rewrite → the cut fires. `qwalk`/`ipe_project`
+  (unknown) → the cost model evaluates and, on the uniform-leak IBM calib, selects
+  **none** (migrate is not cost-positive there), so they run uncut. This is a genuine
+  cost-model decision, made in-pipeline.
+- **Known capability gap (not a requirement violation):** the **migrate/knit rewrites
+  exist only for bare-qubit carries**, not the register-threaded carries real Catalyst
+  emits. So even where the cost model *would* select migrate/knit on an unknown
+  register carry, the rewrite would decline (refresh-only register path). Making
+  migrate/knit fire on `qwalk`/`ipe_project` through the pipeline needs the
+  register-threaded migrate/knit rewrite (future work); until then they exercise the
+  full pipeline as the unbounded arm.
 
 ### 14.7 Out of scope
 
-Multi-slot carries; migrate/knit rewrite on register-threaded carries; a Python
-device path (Catalyst compiled execution is C++-device only); changing the §5 noise
-model (the C++ device mirrors it, validated against `sim/qsim.py`).
+A Python device path (Catalyst compiled execution is C++-device only); changing the §5
+noise model (the C++ device mirrors it, validated against `sim/qsim.py`). The
+register-threaded migrate/knit rewrite is **not** out of scope — it is required future
+work for the cut to fire on unknown register carries (above).
