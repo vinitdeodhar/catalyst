@@ -1,6 +1,7 @@
 === Purl experiment: UNBOUNDED vs KNIT(g4) vs REFRESH(g1) ===
 benchmark ipe   p=0.12   calib: IBM Eagle r3 (qubit 0, p_leak/2q=0.001)
   T1=176us  T2=202us  readout=1200ns  2q_err=8.1e-03  p_leak/2q=1.0e-03  B=12 layers/body   window=[24,2]
+  pass strategy: refresh (proven known state; gamma=1)
   knit  cut (g4): window EMPTY (C_min=24 > C_max=2) -> KNIT inadmissible (divergent variance); reported n/a
   refresh   (g1): C = 2   (2 iters = 24 layers)  [no variance floor -> tight bound]
   refresh C-sweep (lam=1): best C* = 1 (F=0.9671); window [1,2] brackets C*  [S4]
