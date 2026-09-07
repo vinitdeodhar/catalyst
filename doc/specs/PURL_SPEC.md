@@ -1602,3 +1602,96 @@ shot count.
 Seepage (L2), per-qubit or idle-time leakage, leakage spread to gate partners, native
 SWAP or hardware LRU instructions, pools of spares or per-cut partner re-selection,
 changes to refresh or to the knit lowering itself, the γ=3 decomposition.
+
+---
+
+## 14. Compiled-execution eval (benchmarks run through Catalyst on a noisy device)
+
+The §8 eval invokes `quantum-opt --purl` out-of-band and scores against the §5
+NumPy simulator's own executors. **§14 is the faithful eval**: each benchmark is a
+plain Catalyst `@qjit` program, **both Purl passes run inside the Catalyst lowering
+pipeline** (they select and lower the cut), and the program executes on a **noisy
+runtime device** that replaces `lightning.qubit` — so delivered fidelity under
+decoherence is measured *end to end through the real compiler*, with no side
+`quantum-opt` call, no Python circuit mirror, and no per-benchmark execution logic.
+
+### 14.1 Architecture — one uniform path
+
+```
+@qjit @purl_lower_qcut @purl(calib=…, p=…, shots=…) @qml.qnode(QSimDevice(…), mcm_method="one-shot")
+        └── the program (prepare a held state; measurement-conditioned while_loop; return expval)
+```
+
+Three pieces, each generic (no benchmark branching):
+1. **The benchmark is the program.** A builder returns the `@qjit` callable; the pass
+   *decides* the strategy from the program's provability + the calibration (§3.4/§3.5;
+   the eval never names refresh/knit/migrate). The delivered ideal (a fixed Bloch
+   vector, or a per-shot reference) is computed classically for the fidelity score.
+2. **Both passes in the pipeline.** `@purl` then `@purl_lower_qcut` as QNode
+   transforms — the exact passes of §3, run by Catalyst, not re-invoked externally.
+3. **The qsim device replaces lightning** (§14.2), reading the *same* calibration JSON
+   the passes read.
+
+The driver (`eval/run_all.py`) loops benchmarks × noise scale `lam` × seeds, compiles,
+runs, and averages — identical code for every benchmark.
+
+### 14.2 The qsim runtime device (§5 noise model, in C++)
+
+Catalyst executes *compiled* programs that call a device through the runtime C-API, so
+the device must be a **C++ `QuantumDevice` plugin** (a Python device cannot slot into
+the compiled path). `runtime/lib/backend/qsim_qubit` (`librtd_qsim_qubit.so`) is a
+self-contained C++ port of `sim/qsim.py`: statevector trajectory engine, per-gate
+depolarizing, idle amplitude-damping + pure-dephasing over gate/readout/`tau`
+durations, **per-2q absorbing leakage** (a leaked wire reads out garbage; a 2q gate
+touching a leaked wire is a no-op), readout flip — all scaled by `lam`. It is exposed
+by a PennyLane device class (`eval/qsim_device.py`, `get_c_interface`/`config_filepath`)
+that **flattens the shared `ibm_eagle_r3.json` via the same `carried_calib` loader the
+passes use** and forwards the flat rates + `lam` as device kwargs. Single source of
+calibration; the pass model and the executed noise cannot disagree by construction.
+
+### 14.3 Trajectory averaging (how a noisy MCM circuit is run)
+
+A delivered fidelity under noise is an *ensemble* over trajectories. Catalyst's
+mechanism for measurement-conditioned circuits is **`mcm_method="one-shot"`**: it
+re-runs the whole circuit `shots` times, each an INDEPENDENT trajectory (the device
+PRNG advancing), and averages the terminal expval — one compiled `f()` call returns
+the trajectory-averaged expval. `qjit(seed=k)` gives independent ensembles for
+seed error bars. (An analytic per-call expval would return a single deterministic
+trajectory — wrong for `lam>0`; one-shot is required.) `lam=0` reproduces the
+noiseless value exactly.
+
+### 14.4 Fidelity score
+
+For a **fixed-ideal** benchmark the program returns the observable's expval and the
+score is its mean vs the classical ideal. For a **per-shot-reference** benchmark
+(e.g. the projection benchmark, §6.3) the program aligns the delivered wire to the
+shot's own reference before the terminal measurement (a classical-conditioned frame
+flip), so the returned expval directly scores fidelity to that shot's target (ideal
+`+1`) and one-shot averaging yields the correct conditioned mean.
+
+### 14.5 Adding a benchmark
+
+Add a `@qjit` builder to `eval/programs.py` returning `(program, ideal)` and register
+it in `PROGRAMS`. No runner, no strategy declaration, no simulator wiring — the pass
+picks the strategy, the device applies the noise, the driver scores uniformly.
+
+### 14.6 Requirements, coverage, limitations
+
+- **Requires** the runtime device built (`make runtime` → `librtd_qsim_qubit.so`) and
+  the Catalyst frontend.
+- **Single carried slot only.** The pass supports one carried quantum slot (§7
+  `two_carry`: `multi-wire cut unsupported`). Benchmarks whose bodies keep **persistent
+  ancilla wires** thread them as extra carried register slots and are rejected; only
+  the data wire may be a persistent carry (ancillas must be measured/transient each
+  iteration, as in `rus`/`ipe`). Benchmarks needing multiple persistent carries
+  (`ipe_project`, `qwalk` as written) are out of scope for this path until the
+  single-slot limitation is lifted; they remain runnable via the §8 / §5 executors.
+- **Register-threaded carry.** Real Catalyst IR threads the carry as `!quantum.reg`;
+  only the **refresh** rewrite has a register path today, so proven-state benchmarks
+  (`rus`, `ipe`) run fully; migrate/knit-on-register is future work.
+
+### 14.7 Out of scope
+
+Multi-slot carries; migrate/knit rewrite on register-threaded carries; a Python
+device path (Catalyst compiled execution is C++-device only); changing the §5 noise
+model (the C++ device mirrors it, validated against `sim/qsim.py`).
