@@ -1,0 +1,44 @@
+# QSimQubit -- Purl noisy trajectory device. Capabilities mirror the subset used by
+# the Purl benchmarks and the two purl passes' lowered IR.
+schema = 3
+
+[operators.gates]
+
+Hadamard = { properties = [ "invertible", "controllable" ] }
+PauliX   = { properties = [ "invertible", "controllable" ] }
+PauliY   = { properties = [ "invertible", "controllable" ] }
+PauliZ   = { properties = [ "invertible", "controllable" ] }
+Identity = { properties = [ "invertible" ] }
+S        = { properties = [ "invertible", "controllable" ] }
+T        = { properties = [ "invertible", "controllable" ] }
+RX       = { properties = [ "invertible", "controllable" ] }
+RY       = { properties = [ "invertible", "controllable" ] }
+RZ       = { properties = [ "invertible", "controllable" ] }
+PhaseShift = { properties = [ "invertible", "controllable" ] }
+CNOT     = { properties = [ "invertible" ] }
+CZ       = { properties = [ "invertible" ] }
+CRX      = { properties = [ "invertible" ] }
+CRY      = { properties = [ "invertible" ] }
+CRZ      = { properties = [ "invertible" ] }
+Toffoli  = { properties = [ "invertible" ] }
+
+[operators.observables]
+
+Identity = { }
+PauliX   = { }
+PauliY   = { }
+PauliZ   = { }
+
+[measurement_processes]
+
+ExpectationMP = { }
+
+[compilation]
+
+qjit_compatible = true
+runtime_code_generation = false
+dynamic_qubit_management = false
+overlapping_observables = true
+non_commuting_observables = true
+initial_state_prep = false
+supported_mcm_methods = [ "device", "one-shot" ]
