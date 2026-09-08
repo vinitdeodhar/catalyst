@@ -35,10 +35,14 @@ N_QUBITS = 127
 MED = {
     "T1": 250e-6, "T2": 150e-6,
     "gate_1q_time": 32e-9, "gate_1q_err": 2.5e-4,
-    "gate_2q_time": 560e-9, "gate_2q_err": 8e-3,
+    "gate_2q_time": 560e-9, "gate_2q_err": 1e-3,   # WHAT-IF: hand-set low 2q error (real Eagle ~8e-3)
     "readout_time": 1.2e-6, "readout_err": 1.3e-2,
     "tau": 1.0e-6,          # classical feedback / reset latency
     "p_prep": 1e-3,         # state-preparation error (reset+init)
+    # WHAT-IF aging (non-memoryless) leakage: leak rate grows with a qubit's accumulated
+    # 2q-gate usage, reset by measurement. NOT vendor data; a deliberate departure from
+    # the spec's memoryless per-gate model (matches the Heron/erasure aging levers).
+    "tau_age": 8.0,
 }
 
 # --- Heron r2 representative medians (SI units). Tunable-coupler CZ 2q gate. These
@@ -230,7 +234,15 @@ def build_hardware(name, carry_qubit=0):
                           leak_2q_default=ERASURE_LEAK_DEFAULT,
                           partner_edge_leak=ERASURE_PARTNER_EDGE_LEAK,
                           carry_qubit=carry_qubit, leak_source=_ERASURE_LEAK_SOURCE)
-    return build_json(path=path, seed_median=medians, device=device)
+    # eagle: WHAT-IF body p_leak=1e-2 (hand-set leakage-dominant; real Eagle ~1e-3)
+    # with a hand-set CLEAN 1e-4 partner edge on the carry qubit (cheap SWAP edge).
+    return build_json(path=path, seed_median=medians, device=device,
+                      leak_2q_default=1e-2, partner_edge_leak=1e-4,
+                      carry_qubit=carry_qubit,
+                      leak_source="WHAT-IF (NOT vendor data): body p_leak=1e-2 "
+                      "(hand-set leakage-dominant), carry-qubit partner edge "
+                      "leak_2q=1e-4 (clean SWAP edge), gate_2q_err 1e-3 and tau_age=8 "
+                      "also hand-set. Synthetic, not real Eagle.")
 
 
 def load(path=JSON_PATH):
