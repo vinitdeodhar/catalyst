@@ -23,7 +23,7 @@ from eval.programs import PROGRAMS, probe_strategy
 from sim.ibm_dataset import HARDWARE, build_hardware
 
 RESULTS = os.path.join(os.path.dirname(__file__), os.pardir, "results")
-LAMS = (0.0, 1.0, 4.0)
+LAMS = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)
 ARMS = ("purl", "unbounded")
 
 
@@ -78,7 +78,7 @@ def run(name, builder, lams, seeds, shots, calib):
 def main(argv=()):
     fast = "--fast" in argv
     hw, calib = pick_hardware(argv)
-    seeds, shots = (3, 400) if fast else (6, 1500)
+    seeds, shots = (3, 400) if fast else (8, 6000)
     lines = []
     csv = ["benchmark,lam,arm,mean,std,ideal,infidelity,rmse,"
            "iters_min,iters_mean,iters_max,strategy,applied,C,bounded_cap,"

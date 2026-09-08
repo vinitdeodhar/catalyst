@@ -46,12 +46,16 @@ MED = {
 # ibm_marrakesh class, 2024-2025): faster + far cleaner 2q gates than Eagle. Only
 # leakage is NOT from these -- see IBM_LEAK_PER_2Q below (an estimate). ---
 MED_HERON = {
-    "T1": 250e-6, "T2": 180e-6,
+    "T1": 8e-3, "T2": 8e-3,   # what-if: near-idle-coherent (NOT vendor; synthetic regime)
     "gate_1q_time": 32e-9, "gate_1q_err": 2.0e-4,
     "gate_2q_time": 68e-9, "gate_2q_err": 3.0e-3,   # CZ median ~3e-3 (best edges ~1e-3)
     "readout_time": 1.2e-6, "readout_err": 1.0e-2,
     "tau": 1.0e-6,
     "p_prep": 1e-3,
+    # what-if aging (non-memoryless) leakage, same as the erasure regime: leak rate
+    # grows with a qubit's accumulated 2q-gate usage, reset by measurement. NOT vendor
+    # data; a deliberate departure from the spec's memoryless per-gate model.
+    "tau_age": 8.0,
 }
 
 # Per-2q-gate leakage ESTIMATE. IBM does NOT publish leakage for ANY device (Eagle or
@@ -61,14 +65,43 @@ MED_HERON = {
 # provenance in `leak_source`; the gate/coherence numbers above are the real ones.
 IBM_LEAK_PER_2Q = 1e-3
 
+# --- SYNTHETIC erasure-qubit / neutral-atom regime (NOT a real device). Errors are
+# dominated by LEAKAGE (erasure), the computational gate error is low, and coherence is
+# long. This is the regime where MIGRATE pays off: clearing leakage by hopping to a
+# fresh carrier beats the cheap SWAP's gate error. Contrast the transmons above, where
+# gate error >= leakage and migrate is correctly declined. ---
+MED_ERASURE = {
+    "T1": 8e-3, "T2": 8e-3,                          # long coherence
+    "gate_1q_time": 32e-9, "gate_1q_err": 1.0e-5,
+    "gate_2q_time": 68e-9, "gate_2q_err": 1.0e-4,    # LOW computational 2q error
+    "readout_time": 1.2e-6, "readout_err": 1.0e-3,
+    "tau": 1.0e-6,
+    "p_prep": 1e-4,
+    # NON-MEMORYLESS leakage: a qubit's per-2q-gate leak rate grows with accumulated
+    # usage (age), reset by measurement. tau_age gates of usage double the rate. This
+    # is the regime where migrate wins: it keeps the held data on ever-fresh, low-rate
+    # carriers while the unbounded arm lets one qubit age. (A deliberate departure from
+    # the spec's memoryless per-gate model -- see PURL_SPEC 4.1.)
+    "tau_age": 8.0,
+}
+ERASURE_LEAK_DEFAULT = 1e-2        # leakage/erasure is the DOMINANT error (>> gate error)
+ERASURE_PARTNER_EDGE_LEAK = 1e-4   # clean SWAP edge for the migrate partner
+
 _HERE = os.path.dirname(__file__)
 JSON_PATH = os.path.join(_HERE, os.pardir, "benchmarks", "ibm_eagle_r3.json")
 HERON_JSON_PATH = os.path.join(_HERE, os.pardir, "benchmarks", "ibm_heron_r2.json")
+ERASURE_JSON_PATH = os.path.join(_HERE, os.pardir, "benchmarks", "erasure.json")
+_ERASURE_LEAK_SOURCE = (
+    "SYNTHETIC erasure/neutral-atom regime (NOT vendor data): dominant body leakage "
+    "1e-2, low gate_2q_err 1e-4, clean partner edge 1e-4, long coherence T1=T2=8ms -- "
+    "the leakage-dominated regime where migrate pays off")
 # hardware name -> (medians, device label, json path) for the eval's --hardware switch
 HARDWARE = {
     "eagle": (MED, "ibm_eagle_r3 (representative published medians; ECR 2q)", JSON_PATH),
     "heron": (MED_HERON, "ibm_heron_r2 (representative published medians; CZ 2q)",
               HERON_JSON_PATH),
+    "erasure": (MED_ERASURE, "synthetic erasure-qubit regime (leakage-dominated, low "
+                "gate error)", ERASURE_JSON_PATH),
 }
 
 
@@ -147,6 +180,8 @@ def build(seed_median=MED, leak_2q_default=IBM_LEAK_PER_2Q, leak_spread=0.0,
         "readout_time": seed_median["readout_time"],
         "tau": seed_median["tau"],
         "p_prep": seed_median["p_prep"],
+        # aging scale for non-memoryless leakage (synthetic only; omitted -> memoryless).
+        **({"tau_age": seed_median["tau_age"]} if "tau_age" in seed_median else {}),
         # leakage is first-class calibration data (spec 4.1): a REQUIRED default plus
         # OPTIONAL per-edge overrides. IBM does not publish it -> record provenance.
         "leak_2q_default": leak_2q_default,
@@ -173,11 +208,13 @@ def build_json(path=JSON_PATH, leak_2q_default=IBM_LEAK_PER_2Q, leak_spread=0.0,
 # Heron leakage model (spec-directed what-if): body per-2q leakage 3e-3 with a hand-set
 # CHEAP 1e-4 partner edge on the carry qubit. Both are ESTIMATES/levers, not vendor data
 # (IBM publishes no leakage); the 1e-4 edge is deliberately optimistic (30x below body).
-HERON_LEAK_DEFAULT = 3e-3
+HERON_LEAK_DEFAULT = 1e-2
 HERON_PARTNER_EDGE_LEAK = 1e-4
 _HERON_LEAK_SOURCE = (
-    "estimate + what-if: body p_leak=3e-3 (literature-order), carry-qubit partner edge "
-    "leak_2q=1e-4 (hand-set clean SWAP edge, NOT vendor data)")
+    "WHAT-IF (NOT vendor data): body p_leak=1e-2 (hand-set high-leakage / leakage-"
+    "dominated), carry-qubit partner edge leak_2q=1e-4 (clean SWAP edge), plus aging "
+    "leakage (tau_age=8) and long coherence T1=T2=8ms -- the non-memoryless regime "
+    "where migrate pays off. This is synthetic, not real Heron.")
 
 
 def build_hardware(name, carry_qubit=0):
@@ -188,6 +225,11 @@ def build_hardware(name, carry_qubit=0):
                           leak_2q_default=HERON_LEAK_DEFAULT,
                           partner_edge_leak=HERON_PARTNER_EDGE_LEAK,
                           carry_qubit=carry_qubit, leak_source=_HERON_LEAK_SOURCE)
+    if name == "erasure":
+        return build_json(path=path, seed_median=medians, device=device,
+                          leak_2q_default=ERASURE_LEAK_DEFAULT,
+                          partner_edge_leak=ERASURE_PARTNER_EDGE_LEAK,
+                          carry_qubit=carry_qubit, leak_source=_ERASURE_LEAK_SOURCE)
     return build_json(path=path, seed_median=medians, device=device)
 
 
@@ -244,6 +286,14 @@ def carried_calib(qubit=0, path=JSON_PATH):
     d = load(path)
     _validate_leak(d)
     q = d["qubits"][qubit]
+    # cleanest leakage among the carry qubit's incident edges = the SWAP edge migrate
+    # would use (spec 13.1). The device charges THIS (not the body rate) on 2q gates
+    # touching the migrate partner, so the migrate swap is genuinely cheap when a clean
+    # partner edge exists (per-edge leakage, not a single global rate).
+    dflt = d["leak_2q_default"]
+    carry_edge_leaks = [e.get("leak_2q", dflt) for e in d["edges"]
+                        if qubit in e["qubits"]]
+    p_leak_partner = min(carry_edge_leaks) if carry_edge_leaks else dflt
     return {
         "gate_1q": d["gate_1q_time"], "gate_2q": d["gate_2q_time"],
         "readout": d["readout_time"], "tau": d["tau"],
@@ -252,7 +302,12 @@ def carried_calib(qubit=0, path=JSON_PATH):
         "p_ro": q["readout_err"], "p_meas": q["gate_1q_err"],
         # per-2q-gate leakage from the JSON (spec 4.1), global median over edges;
         # the sim charges it on each 2q gate the carried wire touches (qsim._leak_2q).
-        "p_leak": _median_leak(d), "p_prep": d["p_prep"],
+        "p_leak": _median_leak(d), "p_leak_partner": p_leak_partner,
+        # aging scale (non-memoryless leakage; INF = off): leak rate grows with a
+        # qubit's accumulated 2q-gate usage, reset by measurement. Only set on the
+        # synthetic erasure calib -- the regime where migrate genuinely wins.
+        "tau_age": d.get("tau_age", float("inf")),
+        "p_prep": d["p_prep"],
     }
 
 

@@ -50,9 +50,15 @@ class QSimDevice(Device):
         # device kwargs (strings); the C++ device parses them (parse_kwargs).
         c = carried_calib(carry_qubit, path=calib)
         keys = ("gate_1q", "gate_2q", "readout", "tau", "T1", "T2",
-                "p1", "p2", "p_ro", "p_meas", "p_leak")
+                "p1", "p2", "p_ro", "p_meas", "p_leak", "p_leak_partner", "tau_age")
         self.device_kwargs = {k: repr(float(c[k])) for k in keys}
         self.device_kwargs["lam"] = repr(float(lam))
+        # per-edge leakage: the migrate rewrite grows the register by one wire and uses
+        # the top slot (index == `wires`) as the ping-pong partner, so a 2q gate touching
+        # that qubit is the migrate SWAP -> the device charges it `p_leak_partner` (the
+        # clean partner edge), not the body rate. (No qubit at that index for non-migrate
+        # programs, so the tag is inert there.)
+        self.device_kwargs["partner_qubit"] = repr(float(wires))
         self.device_kwargs["calib"] = str(calib)  # provenance (on record)
 
     def execute(self, circuits, execution_config=None):

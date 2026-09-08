@@ -1065,15 +1065,26 @@ static Predicted selectStrategy(double p, const EpsRates &e, const Window &win,
 
     // MIGRATE (gamma = 1, spec 13.2): C in [1, cMax], NO variance floor. Non-
     // transportable (leakage) resets per window (moved to a fresh carrier); the
-    // transportable term carries over with the state (like knit); each migration
-    // charges eps_mig (the 3-CNOT SWAP on the pair edge).
+    // transportable term carries over with the state (like knit).
+    //
+    // The SWAP's gate error (depolarizing on the data qubit) is itself TRANSPORTABLE
+    // and is incurred once every C iterations, so it is charged as a per-iteration
+    // term eps_mig/C that COMPOUNDS over the full carried depth E[k] -- like e.t --
+    // NOT as a one-off `eps_mig * ecuts(C)` bias. The old form undercounted the swap
+    // overhead: ecuts (like E[k]=1/p) assumes a geometric herald, so on loops where
+    // `p` is not a herald success rate (e.g. qwalk's random walk, true depth >> 1/p)
+    // it credited ~1 cut when the loop actually swaps every iteration -- making
+    // migrate look far cheaper than it runs. Amortizing per iteration makes the
+    // migrate-vs-none decision compare per-iteration leakage-cleared against the
+    // per-iteration swap cost, so it no longer hinges on the (often wrong) 1/p depth.
     double bestMig = INFINITY;
     int bestMigC = 0;
     if (hasPair) {
         int lo = forceC > 0 ? forceC : 1;
         int hi = forceC > 0 ? forceC : std::max(1, win.cMax);
         for (int C = lo; C <= hi; ++C) {
-            double bias = e.t * Ek + e.nt * sbar(p, C) + epsMig * ecuts(C);
+            double swapPerIter = epsMig / (double)C; // amortized transportable swap cost
+            double bias = (e.t + swapPerIter) * Ek + e.nt * sbar(p, C);
             double err = rmse(bias, statBase); // gamma=1 -> no variance inflation
             if (err < bestMig) {
                 bestMig = err;

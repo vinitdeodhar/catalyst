@@ -184,7 +184,7 @@ def ipe_project(lam, seed, shots=1500, p=0.45, calib=CALIB, thresh=0.87,
     return _build(f, 1.0, seed, keep, purl_on, calib, p)
 
 
-# All four benchmarks are Python @qjit programs compiled through the ENTIRE Catalyst
+# All benchmarks are Python @qjit programs compiled through the ENTIRE Catalyst
 # pipeline with both purl passes active (spec §14 hard requirement). The pass decides
 # per program: rus/ipe (provable identity) -> refresh; qwalk/ipe_project (unknown) ->
 # the cost model selects (none where migrate is not cost-positive on the calibration;

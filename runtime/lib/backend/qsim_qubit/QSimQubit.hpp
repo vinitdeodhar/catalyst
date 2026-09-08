@@ -47,6 +47,10 @@ class QSimQubit final : public Catalyst::Runtime::QuantumDevice {
     double gate1q_ = 30e-9, gate2q_ = 60e-9, readout_ = 700e-9, tau_ = 500e-9;
     double T1_ = INFINITY, T2_ = INFINITY;
     double p1_ = 0.0, p2_ = 0.0, p_ro_ = 0.0, p_meas_ = 0.0, p_leak_ = 0.0;
+    double p_leak_partner_ = 0.0;     // leakage on the migrate partner (clean) edge
+    long partner_qubit_ = -1;         // migrate partner qubit index (grown top slot)
+    double tau_age_ = INFINITY;       // aging scale: leak rate *= (1 + age/tau_age).
+                                      // INF = memoryless (no aging; the default).
     double lam_ = 1.0;                 // global noise scale (0 = exactly noiseless)
     double inv_T1_ = 0.0, inv_Tphi_ = 0.0;
 
@@ -55,6 +59,7 @@ class QSimQubit final : public Catalyst::Runtime::QuantumDevice {
     std::size_t live_ = 0;            // qubits allocated but not yet released
     std::vector<cd> psi_;             // statevector, little-endian (qubit 0 = LSB)
     std::vector<char> leaked_;        // absorbing per-qubit leakage flags
+    std::vector<double> age_;         // per-qubit accumulated 2q-gate usage (aging)
     std::mt19937 own_rng_{0};
     std::mt19937 *rng_ = &own_rng_;   // runtime PRNG when provided (reproducible)
 
@@ -84,6 +89,9 @@ class QSimQubit final : public Catalyst::Runtime::QuantumDevice {
         p_ro_ = get("p_ro", 0.0);
         p_meas_ = get("p_meas", 0.0);
         p_leak_ = get("p_leak", 0.0);
+        p_leak_partner_ = get("p_leak_partner", p_leak_);
+        partner_qubit_ = (long)std::llround(get("partner_qubit", -1.0));
+        tau_age_ = get("tau_age", INFINITY);
         lam_ = get("lam", 1.0);
         if (!std::isinf(T1_) && !std::isinf(T2_) && T1_ > 0 && T2_ > 0) {
             inv_T1_ = 1.0 / T1_;
@@ -117,6 +125,7 @@ class QSimQubit final : public Catalyst::Runtime::QuantumDevice {
                 psi_[i] = old[i];
         }
         leaked_.resize(n_, 0);
+        age_.resize(n_, 0.0);
         live_ += n;
         std::vector<QubitIdType> ids(n);
         for (std::size_t i = 0; i < n; ++i)
@@ -133,6 +142,7 @@ class QSimQubit final : public Catalyst::Runtime::QuantumDevice {
         if (live_ == 0) {
             psi_.clear();
             leaked_.clear();
+            age_.clear();
             n_ = 0;
         }
     }
@@ -310,15 +320,32 @@ class QSimQubit final : public Catalyst::Runtime::QuantumDevice {
             else if (picks[i] == 3) applyPauli('Z', qs[i]);
     }
 
-    // per-2q-gate ABSORBING leakage on every qubit the gate touches
+    // per-2q-gate ABSORBING leakage on every qubit the gate touches. Per-edge rate: a
+    // 2q gate touching the migrate partner qubit (the grown top slot) is a migrate SWAP
+    // on the clean partner edge, so it leaks at p_leak_partner_ (typically << body
+    // p_leak_); all other 2q gates leak at the body rate. This is what makes migrate
+    // able to win -- the swap onto a fresh, low-leakage carrier is genuinely cheaper
+    // than the leakage the body accrues (spec 13.1).
     void leak2q(const std::vector<std::size_t> &qs)
     {
-        if (lam_ == 0.0 || p_leak_ <= 0.0)
+        if (lam_ == 0.0)
             return;
-        double pl = lam_ * p_leak_;
+        bool onPartner = false;
         for (auto q : qs)
-            if (!leaked_[q] && urand() < pl)
+            if ((long)q == partner_qubit_)
+                onPartner = true;
+        double base = onPartner ? p_leak_partner_ : p_leak_;
+        for (auto q : qs) {
+            // AGING (non-memoryless): a qubit that has been used/held longer leaks
+            // faster; a reset (Measure) zeroes its age. This is the one regime where
+            // migrate wins -- it keeps the data on ever-fresh, low-rate qubits while the
+            // unbounded arm lets it age. tau_age = INF recovers the memoryless model.
+            double rate = base * (1.0 + age_[q] / tau_age_);
+            age_[q] += 1.0;  // this 2q gate ages the qubit
+            double pl = lam_ * rate;
+            if (pl > 0.0 && !leaked_[q] && urand() < pl)
                 leaked_[q] = 1;
+        }
     }
 
     bool anyLeaked(const std::vector<std::size_t> &qs) const
@@ -414,9 +441,21 @@ class QSimQubit final : public Catalyst::Runtime::QuantumDevice {
     {
         std::size_t q = (std::size_t)wire;
         idleOthers({q}, readout_);
-        // a leaked qubit reads out as garbage (uniform bit), no collapse
+        // a leaked qubit reads out as garbage (uniform bit). A measurement RE-INITIALIZES
+        // the physical qubit (measure(reset) / the migrate carrier reset): it clears the
+        // absorbing leak flag AND the aging clock. Crucially it also COLLAPSES the
+        // statevector to the (garbage) computational outcome -- a leaked qubit's psi_ is
+        // a stale placeholder, so we must project it to a DEFINITE state, else clearing
+        // the flag would let later gates (the migrate swap-back) act on meaningless
+        // amplitude and manufacture a spurious benefit. Collapse -> a leaked-then-reset
+        // qubit is a well-defined |garbage>, same delivered error as staying garbage, so
+        // migrate stays NEUTRAL under memoryless leakage and only wins when aging makes
+        // fresh qubits genuinely leak less.
         if (leaked_[q]) {
             bool g = (urand() < 0.5);
+            collapse(q, g ? 1 : 0);
+            leaked_[q] = 0;
+            age_[q] = 0.0;
             return g ? &res_true_ : &res_false_;
         }
         if (lam_ > 0 && p_meas_ > 0 && urand() < lam_ * p_meas_) {
@@ -429,6 +468,7 @@ class QSimQubit final : public Catalyst::Runtime::QuantumDevice {
         else
             outcome = (urand() < probOne(q)) ? 1 : 0;
         collapse(q, outcome);
+        age_[q] = 0.0;   // measurement re-initializes the qubit -> reset the aging clock
         int reported = outcome;
         if (lam_ > 0 && p_ro_ > 0 && urand() < lam_ * p_ro_)
             reported = 1 - outcome;
